@@ -14,16 +14,14 @@ log = logging.getLogger(__name__)
 # ── Tray icon (PIL) ───────────────────────────────────────
 
 def _make_tray_image():
-    from PIL import Image, ImageDraw
+    from PIL import Image
 
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse([4, 4, size - 4, size - 4], fill="#1A73E8")
-    draw.rectangle([16, 24, 48, 40], outline="white", width=2)
-    draw.rectangle([28, 16, 36, 48], outline="white", width=2)
-    draw.ellipse([46, 8, 56, 18], fill="#34A853")
-    return img
+    if getattr(sys, 'frozen', False):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ico = Image.open(os.path.join(base, "app.ico"))
+    return ico.resize((64, 64), Image.LANCZOS)
 
 
 def _tray_label() -> str:

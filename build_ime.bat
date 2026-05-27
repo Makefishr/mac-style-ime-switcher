@@ -40,6 +40,8 @@ pyinstaller --onefile --noconsole --name "MacStyleIME" ^
     --hidden-import ime_switcher.toggle ^
     --hidden-import ime_switcher.hook ^
     --hidden-import ime_switcher.tray ^
+    --add-data "app.ico;." ^
+    --icon "app.ico" ^
     --distpath "." ^
     ime_switcher\__main__.py
 
