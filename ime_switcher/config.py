@@ -47,6 +47,13 @@ LANGID_ZH_CN = 0x0804
 LAYOUT_EN_US = "00000409"
 LAYOUT_ZH_CN = "00000804"
 
+# ── IME conversion-mode control (WM_IME_CONTROL) ────────────
+WM_IME_CONTROL       = 0x0283
+IMC_GETCONVERSIONMODE = 0x0001
+IMC_SETCONVERSIONMODE = 0x0002
+SMTO_ABORTIFHUNG      = 0x0002
+IME_CMODE_NATIVE      = 0x0001   # bit 0 set = native (Chinese) conversion
+
 # ── Misc ──────────────────────────────────────────────────
 ERROR_ALREADY_EXISTS = 183
 

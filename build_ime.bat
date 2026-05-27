@@ -41,7 +41,7 @@ pyinstaller --onefile --noconsole --name "MacStyleIME" ^
     --hidden-import ime_switcher.hook ^
     --hidden-import ime_switcher.tray ^
     --distpath "." ^
-    ime_switcher
+    ime_switcher\__main__.py
 
 if %errorlevel% neq 0 (
     echo 打包失败!

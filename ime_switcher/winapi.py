@@ -120,6 +120,20 @@ kernel32.CloseHandle.restype = wintypes.BOOL
 
 
 # ═══════════════════════════════════════════════════════════
+#  IME window / conversion mode
+# ═══════════════════════════════════════════════════════════
+imm32 = ctypes.windll.imm32
+
+imm32.ImmGetDefaultIMEWnd.argtypes = [wintypes.HWND]
+imm32.ImmGetDefaultIMEWnd.restype = wintypes.HWND
+
+user32.SendMessageTimeoutW.argtypes = [
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    wintypes.UINT, wintypes.UINT, ctypes.POINTER(wintypes.DWORD),
+]
+user32.SendMessageTimeoutW.restype = ctypes.c_longlong
+
+# ═══════════════════════════════════════════════════════════
 #  Helpers
 # ═══════════════════════════════════════════════════════════
 
