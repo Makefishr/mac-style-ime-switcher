@@ -1,0 +1,11 @@
+.env
+.mcp.json
+*.log
+*.spec
+MacStyleIME/
+build/
+__pycache__/
+ime_switcher/__pycache__/
+*.exe
+.claude/
+src/
