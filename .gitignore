@@ -1,0 +1,10 @@
+.env
+.mcp.json
+*.log
+*.spec
+build/
+__pycache__/
+ime_switcher/__pycache__/
+*.exe
+.claude/
+src/
