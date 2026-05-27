@@ -3,7 +3,7 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 echo ============================================
-echo   Mac-style IME Switcher v2.0 — 构建脚本
+echo   Mac-style IME Switcher v1.1 — 构建脚本
 echo ============================================
 echo.
 
