@@ -3,7 +3,7 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 echo ============================================
-echo   Mac-style IME Switcher v1.1 — 构建脚本
+echo   Mac-style IME Switcher v1.2 — 构建脚本
 echo ============================================
 echo.
 
@@ -40,6 +40,7 @@ pyinstaller --onefile --noconsole --name "MacStyleIME" ^
     --hidden-import ime_switcher.toggle ^
     --hidden-import ime_switcher.hook ^
     --hidden-import ime_switcher.tray ^
+    --hidden-import ime_switcher.caps_handler ^
     --add-data "app.ico;." ^
     --icon "app.ico" ^
     --distpath "." ^

@@ -8,7 +8,7 @@ from pathlib import Path
 # ── App identity ──────────────────────────────────────────
 APP_NAME  = "MacStyleIME"
 APP_TITLE = "Mac-style IME Switcher"
-VERSION   = "1.1.0"
+VERSION   = "1.2.0"
 
 # ── Paths ─────────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
