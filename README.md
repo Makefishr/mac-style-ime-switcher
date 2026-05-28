@@ -1,16 +1,16 @@
 # Mac-style IME Switcher
 
-在 Windows 上用 CapsLock 一键切换输入法，像 macOS 一样流畅。
+在 Windows 上用 CapsLock 一键切换输入法，让习惯Mac系统的人在Windows系统上也能顺手拈来
 
 ## 这是什么？
 
 macOS 用户习惯按 **CapsLock** 在中英文之间切换，但 Windows 上
-默认只能用 Win+Space / Ctrl+Shift 这些组合键，切起来又慢又容易按错。
+默认只能用 Win+Space / Ctrl+Shift 这些组合键，无法修改成CapsLock切换。
 
-这个工具就是给 **Windows 10/11** 加一个 Mac 风格的 CapsLock 输入法切换
+这个工具就是给习惯Mac系统切换输入法的人让他在 **Windows 10/11** 系统上也能顺畅使用。
 —— 短按 CapsLock 切中英文，长按照样开启大写锁定。
 
-后台静默运行，托盘常驻，占用几乎为零。重启不丢，开机自己会起来。
+后台静默运行，托盘常驻，占用几乎为零。重启不丢，开机自启。
 
 ## 功能
 
