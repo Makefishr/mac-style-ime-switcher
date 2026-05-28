@@ -45,9 +45,6 @@ def run_background() -> None:
         print("错误: 键盘钩子安装失败，请尝试以管理员身份运行")
         return
 
-    # Ensure CapsLock starts off.
-    hook.force_capslock_off()
-
     # System tray.
     icon = pystray.Icon(
         config.APP_NAME,

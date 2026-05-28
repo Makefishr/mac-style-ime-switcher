@@ -6,7 +6,7 @@ import sys
 import winreg
 
 from . import config
-from . import toggle
+from .caps_ime import engine
 
 log = logging.getLogger(__name__)
 
@@ -25,8 +25,8 @@ def _make_tray_image():
 
 
 def _tray_label() -> str:
-    is_cn = toggle.get_ime_status()
-    return f"IME: {'中' if is_cn else 'En'}"
+    state = engine.ime_state
+    return f"IME: {state.value}"
 
 
 # ── Auto-start (registry) ─────────────────────────────────

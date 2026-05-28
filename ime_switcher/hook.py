@@ -2,78 +2,22 @@
 
 import ctypes
 import logging
-import threading
 import time
 from ctypes import wintypes
 
 from . import config
-from . import toggle
-from .caps_handler import CapsLockHandler
+from .caps_ime import engine, VK_CAPITAL
 from .winapi import HOOKPROC, KBDLLHOOKSTRUCT, is_key_down, kernel32, user32
 
 log = logging.getLogger(__name__)
 
-# ── Internal state ────────────────────────────────────────
+
+# ── Shortcut-blocking state ──────────────────────────────────
 _mod_ctrl_down = False
 
 
-# ── CapsLock dual-action callbacks ────────────────────────
+# ── Keyboard hook ────────────────────────────────────────────
 
-def _do_short_press() -> None:
-    """Toggle IME (runs in a thread — never blocks the hook)."""
-    try:
-        toggle.switch_ime()
-        time.sleep(0.03)
-        _force_capslock_off()
-    except Exception:
-        config.log_exception()
-
-
-def _on_short_press() -> None:
-    """Quick CapsLock press → toggle IME (non-blocking)."""
-    threading.Thread(target=_do_short_press, daemon=True).start()
-
-
-def _do_long_press() -> None:
-    """Enable CapsLock uppercase (runs in a thread)."""
-    time.sleep(0.01)  # let the physical UP clear the system key state
-    user32.keybd_event(config.VK_CAPITAL, 0, 0, 0)
-    user32.keybd_event(config.VK_CAPITAL, 0, config.KEYEVENTF_KEYUP, 0)
-    log.info("CapsLock long-press → uppercase ON")
-
-
-def _on_long_press() -> None:
-    """Long CapsLock press (1 s) → enable uppercase (non-blocking)."""
-    threading.Thread(target=_do_long_press, daemon=True).start()
-
-
-_caps_handler = CapsLockHandler(
-    on_short_press=_on_short_press,
-    on_long_press=_on_long_press,
-    long_press_seconds=1.0,
-)
-
-
-# ── CapsLock LED ──────────────────────────────────────────
-
-def _force_capslock_off() -> None:
-    """Send a synthetic CapsLock keystroke to turn the LED off.
-
-    The keyboard hook passes injected events through automatically
-    (``LLKHF_INJECTED`` flag), so this toggle is invisible to our
-    CapsLock handler.
-    """
-    if user32.GetKeyState(config.VK_CAPITAL) & 1:
-        user32.keybd_event(config.VK_CAPITAL, 0, 0, 0)
-        user32.keybd_event(config.VK_CAPITAL, 0, config.KEYEVENTF_KEYUP, 0)
-
-
-def force_capslock_off() -> None:
-    """Public wrapper — same as internal version, kept for __main__.py."""
-    _force_capslock_off()
-
-
-# ── Keyboard hook ─────────────────────────────────────────
 
 @HOOKPROC
 def _keyboard_hook(nCode: int, wParam: int, lParam: int) -> int:
@@ -100,23 +44,9 @@ def _keyboard_hook(nCode: int, wParam: int, lParam: int) -> int:
     elif not is_down and vk in (config.VK_CONTROL, config.VK_LCONTROL, config.VK_RCONTROL):
         _mod_ctrl_down = False
 
-    # ── CapsLock (must handle both DOWN and UP) ──
-    if vk == config.VK_CAPITAL:
-        if is_down:
-            capslock_on = bool(user32.GetKeyState(config.VK_CAPITAL) & 1)
-            if _caps_handler.handle_down(capslock_is_on=capslock_on):
-                return 1
-        else:
-            result = _caps_handler.handle_up()
-            if result == "short":
-                return 1                       # eat UP
-            if result == "long":
-                return user32.CallNextHookEx(  # pass UP through
-                    config.hook_handle, nCode, wParam, lParam,
-                )
-        return user32.CallNextHookEx(
-            config.hook_handle, nCode, wParam, lParam,
-        )
+    # ── CapsLock: delegate to the deep module ──
+    if engine.on_key_event(vk, is_down):
+        return 1
 
     if not is_down:
         return user32.CallNextHookEx(
@@ -140,7 +70,8 @@ def _keyboard_hook(nCode: int, wParam: int, lParam: int) -> int:
     )
 
 
-# ── Hook thread ───────────────────────────────────────────
+# ── Hook thread ──────────────────────────────────────────────
+
 
 def hook_thread_main() -> None:
     """Install the low-level keyboard hook and run the message loop."""
