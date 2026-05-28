@@ -34,16 +34,6 @@ MacStyleIME.exe --uninstall
 # 安装依赖
 pip install pystray pillow pyinstaller
 
-# 构建
-python -m PyInstaller --onefile --noconsole --name "MacStyleIME" \
-    --hidden-import pystray --hidden-import PIL --hidden-import PIL.Image --hidden-import PIL.ImageDraw \
-    --hidden-import ime_switcher.config --hidden-import ime_switcher.winapi \
-    --hidden-import ime_switcher.toggle --hidden-import ime_switcher.hook \
-    --hidden-import ime_switcher.tray \
-    --hidden-import ime_switcher.caps_handler \
-    --add-data "app.ico;." --icon "app.ico" \
-    --distpath "." ime_switcher/__main__.py
-
 # 或直接运行构建脚本
 build_ime.bat
 ```
@@ -54,14 +44,14 @@ build_ime.bat
 ime_switcher/
 ├── __init__.py      # 包标记
 ├── __main__.py      # 入口：单例检查、CLI 解析、主循环
+├── caps_ime.py      # CapsLock IME 引擎（短按/长按状态机、LED管理）
 ├── config.py        # 常量、日志、全局状态
-├── winapi.py        # Win32 API 声明和封装
-├── toggle.py        # 输入法切换核心逻辑
 ├── hook.py          # 低级键盘钩子 (WH_KEYBOARD_LL)
-├── caps_handler.py  # CapsLock 双动作状态机（短按/长按）
+├── toggle.py        # 输入法切换核心逻辑
 ├── tray.py          # 系统托盘和注册表自启
+├── winapi.py        # Win32 API 声明和封装
 tests/
-└── test_caps_handler.py  # CapsLock 状态机单元测试
+└── test_caps_ime.py  # CapsLock IME 引擎单元测试
 ```
 
 ## 原理
