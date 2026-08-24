@@ -15,6 +15,7 @@ if not getattr(sys, 'frozen', False):
 
 from ime_switcher import config
 from ime_switcher import hook
+from ime_switcher import settings
 from ime_switcher import tray
 from ime_switcher.winapi import kernel32
 
@@ -64,6 +65,11 @@ def run_background() -> None:
 
 
 def main() -> None:
+    # Optional elevation is a single-process restart.  CLI maintenance
+    # commands remain usable without elevation.
+    if len(sys.argv) == 1 and not settings.maybe_relaunch_as_admin():
+        return
+
     if not _check_single_instance():
         print("程序已在运行中")
         log.warning("Duplicate instance rejected")
