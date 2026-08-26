@@ -1,115 +1,73 @@
 # Mac-style IME Switcher
 
-在 Windows 10/11 上模仿 macOS 的 CapsLock 手势：短按控制中文/英文，长按进入大写。程序在后台运行，常驻系统托盘。
+适用于 Windows 10/11 的 CapsLock 中英文切换工具。程序常驻系统托盘，短按 CapsLock 切换输入法，长按进入或退出大写锁定。
 
-## 下载与快速使用
+## 下载与快速开始
 
-1. 从 [GitHub Releases 的 latest 页面](https://github.com/Makefishr/mac-style-ime-switcher/releases/latest) 下载正式的 `MacStyleIME.exe`。
-2. 将 EXE 放在稳定、可写的目录中并运行。程序没有主窗口，右键托盘图标可打开“设置”或退出。
-3. 在“设置”中选择切换模式，并按需启用开机自启或管理员启动。
+1. 从 [Releases](https://github.com/Makefishr/mac-style-ime-switcher/releases/latest) 下载 `MacStyleIME.exe`。
+2. 直接运行，无需安装。
+3. 右键托盘图标打开“设置”。
+4. 如果需要在管理员 CMD、Windows Terminal 或其他管理员应用中切换，请启用“以管理员身份运行”。
 
-程序只允许一个逻辑实例运行。普通使用不需要管理员权限。
+启用管理员模式后，Windows 会显示 UAC 请求；取消或启动失败时，MacStyleIME 会回到普通模式继续运行。
 
-## 按键行为
+## CapsLock 行为
 
-### CapsLock
+- **短按**：执行设置中选择的输入法切换方式。
+- **长按 1 秒后松开**：进入或退出大写锁定，CapsLock 指示灯会同步变化。
+- **普通 Shift 组合不受影响**：例如 `Shift+1` 仍可正常输入 `!`。
 
-- **短按（不足 1 秒）**：在当前上下文属于所选模式的支持范围时，执行一次中文/英文切换。
-- **长按（达到 1 秒）**：在受支持上下文中进入原生大写锁定，CapsLock LED 亮起；再次按 CapsLock 退出大写。
-- **不支持、无法识别或切换失败**：原物理按键不会直接交给下游；程序会在松开后回放一次完整的原生 CapsLock 按下和抬起，因此不会吞掉 CapsLock 的原生切换语义。
-- 自动重复的 CapsLock keydown 仍属于同一次按压，不会产生多个动作。
+程序会拦截 Windows 默认的输入法切换组合 `Win+Space`、`Ctrl+Space`、`Ctrl+Shift` 和 `Alt+Shift`，避免它们改变 MacStyleIME 管理的输入法状态。
 
-CapsLock 的上下文判断和切换在单个后台 worker 中按顺序完成；键盘 hook 本身只记录手势并快速返回。
+## 两种切换方式
 
-### Shift 与系统切换快捷键
+### 切换键盘输入法
 
-- 单独轻按通用 Shift、左 Shift 或右 Shift（包括自动重复）不会传给微软拼音，因此不会触发其 Shift 中英切换。
-- Shift 与字母或其他普通键组合时（也可同时按住 Ctrl/Alt），程序会先重放对应的左/右 Shift，再重放目标键，保留键盘大写和快捷键修饰语义。
-- `Win+Space`、`Ctrl+Space`、仅修饰键的 `Ctrl+Shift` 与 `Alt+Shift` 会被拦截，避免绕过 CapsLock 切换逻辑。
+在英文键盘和微软拼音键盘之间切换。这是默认方式，需要先在 Windows 中添加中文和英文键盘布局。
 
-## 两种切换模式
+### 仅切换微软拼音内部中英文
 
-### 中文键盘布局 / 英文键盘布局（默认）
+保持微软拼音键盘不变，只切换其内部中文/英文模式。使用前请先切到微软拼音。
 
-只在当前活动输入上下文明确为简体中文（zh-CN）或美国英语（en-US）时工作：
+该方式使用 Windows IMM 兼容接口，不发送 Shift，也不切换键盘布局。它适用于已经支持该接口的输入框，但不能保证覆盖所有现代 TSF、WinUI、UWP 或浏览器输入框。
 
-- zh-CN → en-US
-- en-US → zh-CN
+## 设置
 
-布局模式只切换键盘布局，不读取或修改微软拼音内部的 open/conversion 状态。其他语言、目标布局不可用或布局请求失败时，程序不会假装成功，而是回放原生 CapsLock。
+- **以管理员身份运行**：允许 MacStyleIME 处理相同或更低权限应用中的按键，包括管理员应用。
+- **输入法切换方式**：在两种 CapsLock 切换行为之间选择。
+- **开机时自动运行**：为当前 Windows 用户写入启动项。
 
-### 微软拼音内部中文/英文模式
+设置和诊断日志保存在 `%LOCALAPPDATA%\MacStyleIME`。
 
-此模式不更换键盘布局。它只在当前活动上下文同时满足以下条件时工作：
+## 命令行
 
-- 当前语言明确为 zh-CN；
-- 输入法描述经规范化后明确识别为“微软拼音”或“Microsoft Pinyin”。
-
-程序读取微软拼音的 open/conversion 状态，写入目标状态后再读回确认。描述为空、未知输入法、窗口或 IME 查询失败、写入失败、超时或读回不一致时均按不支持处理，并回放原生 CapsLock。
-
-## 设置、配置与日志
-
-托盘菜单只包含“设置”和“退出”。设置窗口提供：
-
-- CapsLock 切换模式；
-- 当前用户开机自启；
-- 可选的管理员启动。
-
-设置成功后窗口直接关闭；保存失败时窗口保持打开并显示错误。配置文件和当前用户的开机自启项会作为一次保存操作处理，无法完整回滚时会提示重新检查开机自启。
-
-- 配置：EXE 同目录下的 `ime_switcher.json`
-- 日志：`%LOCALAPPDATA%\MacStyleIME\ime_switcher.log`
-- 日志回退位置：`%TEMP%\MacStyleIME\ime_switcher.log`
-
-退出正在运行的托盘程序后，也可直接维护当前用户的开机自启项：
-
-```bat
-MacStyleIME.exe --install
-MacStyleIME.exe --uninstall
+```text
+MacStyleIME.exe              运行并驻留系统托盘
+MacStyleIME.exe --install    添加当前用户开机自启
+MacStyleIME.exe --uninstall  移除当前用户开机自启
+MacStyleIME.exe --help       显示帮助
 ```
 
-这两个命令只修改开机自启项，不改写 `ime_switcher.json`。
+## 兼容边界
 
-## 权限与安全边界
+- 管理员模式不会绕过 Windows 安全桌面，也不能作用于登录界面、锁屏或 UAC 确认窗口。
+- 微软拼音内部模式依赖目标输入框对 IMM 兼容消息的支持；不支持时会保持当前状态。
+- 程序只处理当前交互桌面的键盘输入。
 
-管理员启动默认关闭，保存后在下次普通启动时生效。自动请求管理员权限必须同时满足：
+## 隐私
 
-- 运行的是打包后的 EXE；
-- EXE 位于 Windows Known Folder API 返回的真实 `Program Files` 或 `Program Files (x86)` 目录内；
-- 当前进程尚未具有管理员权限。
-
-程序不信任可由进程修改的 `ProgramFiles` 环境变量，也不会从普通便携目录自动提升。受保护目录无法确认、路径不在上述目录内、UAC 被取消或提升失败时，程序会记录日志并退出，不会假装已获得权限。
+- 不包含遥测、联网、上传或自动更新逻辑。
+- 键盘钩子只瞬时处理完成切换所需的虚拟键状态，不记录输入内容、剪贴板或窗口标题。
+- 诊断日志包含启动、切换结果、错误和本地路径，不包含键入文本。
 
 ## 从源码构建
 
-构建要求以 [`build_ime.bat`](build_ime.bat) 和 [`requirements-build.lock`](requirements-build.lock) 为准。脚本会验证 Windows x64 的 CPython 3.12、官方 Python launcher 与 Windows PowerShell，并在项目目录创建隔离的 `.venv-build`。
+需要 64 位 Python 3.12。在仓库根目录运行：
 
 ```bat
 build_ime.bat
 ```
 
-依赖由 `requirements-build.lock` 固定版本和 SHA-256 hash，并通过 `--require-hashes` 安装；不要用全局 `pip` 或 `pyinstaller` 替代构建脚本。默认产物位于 `dist\MacStyleIME.exe`。
+构建脚本会创建全新的隔离环境，通过 `requirements-build.txt` 校验所有直接和间接依赖的版本与 SHA-256，并在成功后生成根目录下的 `MacStyleIME.exe`。
 
-## 实现与项目结构
-
-程序通过 `WH_KEYBOARD_LL` 处理物理键盘事件。CapsLock 的上下文查询与副作用在有界单 worker 中执行；Shift 键盘组合通过单批 `SendInput` 保持修饰键与目标键的顺序。注入的回放事件会直接绕过本程序的 hook，避免递归。
-
-```text
-ime_switcher/
-├── __main__.py      # 单实例、命令行和托盘主循环
-├── config.py        # 常量、路径与日志
-├── hook.py          # 低级键盘 hook 和 SendInput 边界
-├── shift_guard.py   # Shift tap 抑制与键盘组合重放
-├── caps_ime.py      # CapsLock 手势、worker 与 LED 状态
-├── toggle.py        # 布局和微软拼音内部模式切换
-├── settings.py      # 设置、开机自启和管理员重启
-├── tray.py          # 托盘菜单
-└── winapi.py        # Win32 API 声明与封装
-tests/               # 行为与构建契约测试
-build_ime.bat        # 锁定依赖的 Windows 构建入口
-requirements-build.lock
-```
-
-## 许可证
-
-本项目采用 [MIT License](LICENSE)。
+更新构建依赖时，先修改 `requirements-build.in`，再在受控的 Windows x64 / Python 3.12 环境中重新生成并审查锁文件。

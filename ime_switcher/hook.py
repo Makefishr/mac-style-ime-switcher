@@ -7,172 +7,13 @@ from ctypes import wintypes
 
 from . import config
 from .caps_ime import engine, VK_CAPITAL
-from .shift_guard import HookDecision, KeyEvent, ShiftTapGuard
-from .winapi import INPUT, HOOKPROC, KBDLLHOOKSTRUCT, kernel32, user32
+from .winapi import HOOKPROC, KBDLLHOOKSTRUCT, is_key_down, kernel32, user32
 
 log = logging.getLogger(__name__)
 
 
-def _input_batch(events: tuple[KeyEvent, ...]):
-    inputs = (INPUT * len(events))()
-    for index, event in enumerate(events):
-        flags = config.KEYEVENTF_SCANCODE
-        if event.flags & config.LLKHF_EXTENDED:
-            flags |= config.KEYEVENTF_EXTENDEDKEY
-        if not event.is_down:
-            flags |= config.KEYEVENTF_KEYUP
-
-        inputs[index].type = config.INPUT_KEYBOARD
-        inputs[index].ki.wVk = 0
-        inputs[index].ki.wScan = event.scan_code
-        inputs[index].ki.dwFlags = flags
-        inputs[index].ki.time = 0
-        inputs[index].ki.dwExtraInfo = 0
-    return inputs
-
-
-def send_replay(events: tuple[KeyEvent, ...], send_input=None) -> int:
-    """Submit one Win32 keyboard-input batch and return inserted count."""
-    if not events:
-        return 0
-
-    inputs = _input_batch(events)
-    sender = user32.SendInput if send_input is None else send_input
-    inserted = sender(len(events), inputs, ctypes.sizeof(INPUT))
-    return int(inserted)
-
-
-def submit_replay(events: tuple[KeyEvent, ...], send_input=None) -> bool:
-    """Submit a replay sequence and report whether the whole batch landed."""
-    if not events:
-        return True
-    return send_replay(events, send_input=send_input) == len(events)
-
-
-class KeyboardHookProcessor:
-    """Production keyboard-hook event boundary."""
-
-    def __init__(self, policy: ShiftTapGuard | None = None) -> None:
-        self._policy = policy or ShiftTapGuard()
-
-    def process(self, event: KeyEvent) -> HookDecision:
-        return self._policy.process(event)
-
-    def reset(self) -> HookDecision:
-        return self._policy.reset()
-
-
-_event_processor = KeyboardHookProcessor()
-
-
-def reset_capslock_state(caps_engine=None) -> bool:
-    """Reset CapsLock gesture state when the engine exposes that capability."""
-    target = engine if caps_engine is None else caps_engine
-    resetter = getattr(target, "reset", None)
-    if not callable(resetter):
-        return True
-    try:
-        resetter()
-    except Exception:
-        log.exception("CapsLock hook state reset failed")
-        return False
-    return True
-
-
-def reset_hook_state(
-    processor: KeyboardHookProcessor | None = None,
-    send_input=None,
-    release_input=None,
-) -> bool:
-    """Reset a hook processor and release any synthetic modifiers it owns."""
-    target = _event_processor if processor is None else processor
-    decision = target.reset()
-    if not decision.replay:
-        return True
-    if submit_replay(decision.replay, send_input=send_input):
-        return True
-
-    fallback = user32.keybd_event if release_input is None else release_input
-    try:
-        for release in decision.replay:
-            fallback(
-                release.vk_code,
-                release.scan_code & 0xFF,
-                config.KEYEVENTF_KEYUP,
-                0,
-            )
-    except Exception:
-        log.exception("Lifecycle Shift release fallback failed")
-        return False
-    return True
-
-
-def dispatch_keyboard_event(
-    event: KeyEvent,
-    processor: KeyboardHookProcessor | None = None,
-    send_input=None,
-    release_input=None,
-) -> HookDecision:
-    """Apply policy and make replay failure observable at the hook boundary."""
-    target = _event_processor if processor is None else processor
-    decision = target.process(event)
-    if not decision.replay:
-        return decision
-
-    inserted = send_replay(decision.replay, send_input=send_input)
-    if inserted == len(decision.replay):
-        return decision
-
-    if not event.is_down:
-        return HookDecision(forward=True)
-
-    cleanup = target.reset().replay
-    if inserted and cleanup:
-        cleanup_inserted = send_replay(cleanup, send_input=send_input)
-        if cleanup_inserted != len(cleanup):
-            fallback = (
-                user32.keybd_event
-                if release_input is None else release_input
-            )
-            try:
-                for release in cleanup:
-                    fallback(
-                        release.vk_code,
-                        release.scan_code & 0xFF,
-                        config.KEYEVENTF_KEYUP,
-                        0,
-                    )
-            except Exception:
-                log.exception("Synthetic Shift release fallback failed")
-                return HookDecision(forward=False)
-    return HookDecision(forward=True)
-
-
-def dispatch_hook_event(
-    event: KeyEvent,
-    *,
-    caps_engine=None,
-    processor: KeyboardHookProcessor | None = None,
-    send_input=None,
-    release_input=None,
-) -> HookDecision:
-    """Dispatch one low-level event through CapsLock and Shift policies."""
-    if event.flags & config.LLKHF_INJECTED:
-        return HookDecision(forward=True)
-
-    target_caps = engine if caps_engine is None else caps_engine
-    if (
-        event.vk_code == VK_CAPITAL
-        and target_caps.on_key_event(event.vk_code, event.is_down)
-    ):
-        return HookDecision(forward=False)
-
-    return dispatch_keyboard_event(
-        event,
-        processor=processor,
-        send_input=send_input,
-        release_input=release_input,
-    )
+# ── Shortcut-blocking state ──────────────────────────────────
+_mod_ctrl_down = False
 
 
 # ── Keyboard hook ────────────────────────────────────────────
@@ -180,24 +21,48 @@ def dispatch_hook_event(
 
 @HOOKPROC
 def _keyboard_hook(nCode: int, wParam: int, lParam: int) -> int:
+    global _mod_ctrl_down
+
     if nCode < 0:
         return user32.CallNextHookEx(
             config.hook_handle, nCode, wParam, lParam,
         )
 
     kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+    vk = kb.vkCode
     is_down = wParam in (config.WM_KEYDOWN, config.WM_SYSKEYDOWN)
-    event = KeyEvent(
-        vk_code=kb.vkCode,
-        scan_code=kb.scanCode,
-        flags=kb.flags,
-        is_down=is_down,
-    )
 
-    decision = dispatch_hook_event(event)
-    if decision.replay:
+    # Synthetic events generated by the CapsLock adapter always pass through.
+    if kb.flags & config.LLKHF_INJECTED:
+        return user32.CallNextHookEx(
+            config.hook_handle, nCode, wParam, lParam,
+        )
+
+    # Track Ctrl state ourselves — more reliable than GetAsyncKeyState.
+    if is_down and vk in (config.VK_CONTROL, config.VK_LCONTROL, config.VK_RCONTROL):
+        _mod_ctrl_down = True
+    elif not is_down and vk in (config.VK_CONTROL, config.VK_LCONTROL, config.VK_RCONTROL):
+        _mod_ctrl_down = False
+
+    # ── CapsLock: delegate to the deep module ──
+    if engine.on_key_event(vk, is_down):
         return 1
-    if not decision.forward:
+
+    if not is_down:
+        return user32.CallNextHookEx(
+            config.hook_handle, nCode, wParam, lParam,
+        )
+
+    # ── Block Windows default IME shortcuts ──
+    if vk == config.VK_SPACE and (
+        is_key_down(config.VK_LWIN) or is_key_down(config.VK_RWIN)
+    ):
+        return 1
+    if vk == config.VK_SPACE and _mod_ctrl_down:
+        return 1
+    if vk == config.VK_SHIFT and _mod_ctrl_down:
+        return 1
+    if vk == config.VK_SHIFT and is_key_down(config.VK_MENU):
         return 1
 
     return user32.CallNextHookEx(
@@ -210,11 +75,6 @@ def _keyboard_hook(nCode: int, wParam: int, lParam: int) -> int:
 
 def hook_thread_main() -> None:
     """Install the low-level keyboard hook and run the message loop."""
-    if not reset_capslock_state():
-        log.error("CapsLock state reset failed before install")
-    if not reset_hook_state():
-        log.error("Keyboard hook state reset failed before install")
-
     module = kernel32.GetModuleHandleW(None)
     ptr = user32.SetWindowsHookExW(
         config.WH_KEYBOARD_LL, _keyboard_hook, module, 0,
@@ -234,10 +94,6 @@ def hook_thread_main() -> None:
         else:
             time.sleep(0.005)
 
-    if not reset_capslock_state():
-        log.error("CapsLock state reset failed before uninstall")
-    if not reset_hook_state():
-        log.error("Keyboard hook state reset failed before uninstall")
     user32.UnhookWindowsHookEx(config.hook_handle)
     config.hook_handle = None
     log.info("Keyboard hook uninstalled")

@@ -1,424 +1,321 @@
 """IME / keyboard-layout switching logic."""
 
+from __future__ import annotations
+
 import ctypes
 import logging
-import unicodedata
-from ctypes import wintypes
+import time
+from dataclasses import dataclass
 
 from . import config
-from .winapi import GUITHREADINFO, imm32, kernel32, user32
+from .settings_store import SwitchingMethod
+from .winapi import DWORD_PTR, GUITHREADINFO, imm32, user32
 
 log = logging.getLogger(__name__)
 
+_LEGACY_CONSOLE_WINDOW_CLASS = "ConsoleWindowClass"
+_DIALOG_WINDOW_CLASS = "#32770"
+_LANGUAGE_CHANGE_TIMEOUT_SECONDS = 0.5
+_LANGUAGE_CHANGE_POLL_SECONDS = 0.01
+_IME_MODE_SETTLE_SECONDS = 0.02
+_active_switching_method = SwitchingMethod.KEYBOARD_LAYOUTS
 
-def _input_targets() -> tuple[int | None, int | None]:
-    """Return (focused input HWND, foreground top-level HWND)."""
-    foreground = user32.GetForegroundWindow()
-    if not foreground:
-        return None, None
 
-    target = foreground
-    thread_id = user32.GetWindowThreadProcessId(foreground, None)
+@dataclass(frozen=True)
+class _InputState:
+    foreground: int
+    target: int
+    legacy_console: bool
+    language: int | None
+    conversion_mode: int | None
+    open_status: bool | None
+
+    @property
+    def can_type_chinese(self) -> bool:
+        if self.language != config.LANGID_ZH_CN:
+            return False
+        if self.open_status is False:
+            return False
+        if self.conversion_mode is not None:
+            return bool(self.conversion_mode & config.IME_CMODE_NATIVE)
+        return True
+
+
+def _get_ime_window(hwnd: int) -> int | None:
+    ime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
+    return ime_wnd or None
+
+
+def _get_window_class(hwnd: int) -> str | None:
+    class_name = ctypes.create_unicode_buffer(256)
+    length = user32.GetClassNameW(hwnd, class_name, len(class_name))
+    return class_name.value if length > 0 else None
+
+
+def _get_input_message_target(fg_hwnd: int) -> int:
+    """Return the actual focused control for dialogs, or the top-level window."""
+    if _get_window_class(fg_hwnd) != _DIALOG_WINDOW_CLASS:
+        return fg_hwnd
+
+    tid = user32.GetWindowThreadProcessId(fg_hwnd, None)
+    if not tid:
+        return fg_hwnd
     info = GUITHREADINFO()
     info.cbSize = ctypes.sizeof(info)
-    if (
-        thread_id
-        and user32.GetGUIThreadInfo(thread_id, ctypes.byref(info))
-        and info.hwndFocus
-    ):
-        target = info.hwndFocus
-    return target, foreground
+    if user32.GetGUIThreadInfo(tid, ctypes.byref(info)) and info.hwndFocus:
+        return info.hwndFocus
+    return fg_hwnd
 
 
-def _default_ime_window(hwnd: int) -> int | None:
-    if not hwnd:
+def _get_window_language(hwnd: int) -> int | None:
+    tid = user32.GetWindowThreadProcessId(hwnd, None)
+    if not tid:
         return None
-    ime_window = imm32.ImmGetDefaultIMEWnd(hwnd)
-    return int(ime_window) if ime_window else None
+    hkl = user32.GetKeyboardLayout(tid)
+    return (hkl & 0xFFFF) if hkl else None
 
 
-def _send_ime_control(hwnd: int, control: int, value: int = 0) -> int | None:
-    """Use the IME's compatibility window when the target has no local HIMC."""
-    ime_window = _default_ime_window(hwnd)
-    if not ime_window:
+def _get_ime_window_language(hwnd: int) -> int | None:
+    ime_wnd = _get_ime_window(hwnd)
+    if not ime_wnd:
         return None
-    try:
-        result = ctypes.c_size_t()
-        sent = user32.SendMessageTimeoutW(
-            ime_window,
-            config.WM_IME_CONTROL,
-            control,
-            value,
-            config.SMTO_ABORTIFHUNG,
-            config.IME_CONTROL_TIMEOUT_MS,
-            ctypes.byref(result),
-        )
-    except Exception as exc:
-        log.warning(
-            "WM_IME_CONTROL 失败 exception=%s",
-            type(exc).__name__,
-        )
+    return _get_window_language(ime_wnd)
+
+
+def _query_ime_control(hwnd: int, command: int) -> int | None:
+    ime_wnd = _get_ime_window(hwnd)
+    if not ime_wnd:
         return None
-    if not sent:
-        log.warning(
-            "WM_IME_CONTROL 超时或失败 HWND=%s GetLastError=%s",
-            ime_window,
-            kernel32.GetLastError(),
-        )
+
+    result = DWORD_PTR()
+    ok = user32.SendMessageTimeoutW(
+        ime_wnd,
+        config.WM_IME_CONTROL,
+        command,
+        0,
+        config.SMTO_ABORTIFHUNG,
+        100,
+        ctypes.byref(result),
+    )
+    return result.value if ok else None
+
+
+def _set_ime_control(hwnd: int, command: int, value: int) -> bool:
+    ime_wnd = _get_ime_window(hwnd)
+    if not ime_wnd:
+        return False
+    ok = user32.SendMessageTimeoutW(
+        ime_wnd,
+        config.WM_IME_CONTROL,
+        command,
+        value,
+        config.SMTO_ABORTIFHUNG,
+        100,
+        None,
+    )
+    return ok != 0
+
+
+def _resolve_input_state(fg_hwnd: int | None = None) -> _InputState | None:
+    foreground = fg_hwnd or user32.GetForegroundWindow()
+    if not foreground:
         return None
-    return int(result.value)
 
+    legacy_console = _get_window_class(foreground) == _LEGACY_CONSOLE_WINDOW_CLASS
+    target = foreground if legacy_console else _get_input_message_target(foreground)
+    language = _get_window_language(target)
+    ime_language = _get_ime_window_language(target)
+    if legacy_console and ime_language is not None:
+        language = ime_language
+    elif language is None:
+        language = ime_language
 
-def _get_ime_conversion_mode(hwnd: int) -> int | None:
-    """Read conversion mode from the target HIMC or its default IME window."""
-    himc = imm32.ImmGetContext(hwnd)
-    if himc:
-        try:
-            conversion = wintypes.DWORD()
-            sentence = wintypes.DWORD()
-            ok = imm32.ImmGetConversionStatus(
-                himc, ctypes.byref(conversion), ctypes.byref(sentence),
-            )
-            if ok:
-                return conversion.value
-        except (OSError, ctypes.ArgumentError):
-            log.warning("无法读取 IME conversion 状态")
-            return None
-        finally:
-            imm32.ImmReleaseContext(hwnd, himc)
-    result = _send_ime_control(hwnd, config.IMC_GETCONVERSIONMODE)
-    return result
-
-
-def _get_mode_with_fallback(target: int | None, foreground: int | None) -> int | None:
-    if target:
-        mode = _get_ime_conversion_mode(target)
-        if mode is not None:
-            return mode
-    if foreground and foreground != target:
-        return _get_ime_conversion_mode(foreground)
-    return None
-
-
-def _get_ime_open_status(hwnd: int) -> bool | None:
-    """Read whether the target IME is open; ``False`` is a valid state."""
-    himc = imm32.ImmGetContext(hwnd)
-    if himc:
-        try:
-            return bool(imm32.ImmGetOpenStatus(himc))
-        except (OSError, ctypes.ArgumentError):
-            log.warning("无法读取 IME open 状态")
-            return None
-        finally:
-            imm32.ImmReleaseContext(hwnd, himc)
-    result = _send_ime_control(hwnd, config.IMC_GETOPENSTATUS)
-    return None if result is None else bool(result)
-
-
-def _get_open_status_with_fallback(
-    target: int | None, foreground: int | None,
-) -> bool | None:
-    if target:
-        status = _get_ime_open_status(target)
-        if status is not None:
-            return status
-    if foreground and foreground != target:
-        return _get_ime_open_status(foreground)
-    return None
-
-
-def _set_ime_conversion_mode(hwnd: int, mode: int) -> bool:
-    """Write the target HIMC or its default IME window."""
-    himc = imm32.ImmGetContext(hwnd)
-    if himc:
-        try:
-            current = wintypes.DWORD()
-            sentence = wintypes.DWORD()
-            if imm32.ImmGetConversionStatus(
-                himc, ctypes.byref(current), ctypes.byref(sentence),
-            ) and imm32.ImmSetConversionStatus(
-                himc, mode, sentence.value,
-            ):
-                return True
-        except (OSError, ctypes.ArgumentError):
-            log.warning("无法写入 IME conversion 状态")
-            return False
-        finally:
-            imm32.ImmReleaseContext(hwnd, himc)
-    return _send_ime_control(
-        hwnd, config.IMC_SETCONVERSIONMODE, mode,
-    ) is not None
-
-
-def _set_ime_open_status(hwnd: int, open_status: bool) -> bool:
-    himc = imm32.ImmGetContext(hwnd)
-    if himc:
-        try:
-            if imm32.ImmSetOpenStatus(himc, bool(open_status)):
-                return True
-        except (OSError, ctypes.ArgumentError):
-            log.warning("无法写入 IME open 状态")
-            return False
-        finally:
-            imm32.ImmReleaseContext(hwnd, himc)
-    return _send_ime_control(
-        hwnd, config.IMC_SETOPENSTATUS, int(bool(open_status)),
-    ) is not None
-
-
-def _set_open_status_with_fallback(
-    target: int | None, foreground: int | None, open_status: bool,
-) -> bool:
-    if target and _set_ime_open_status(target, open_status):
-        return True
-    if foreground and foreground != target:
-        return _set_ime_open_status(foreground, open_status)
-    return False
-
-
-def _set_mode_with_fallback(
-    target: int | None, foreground: int | None, mode: int,
-) -> bool:
-    if target and _set_ime_conversion_mode(target, mode):
-        return True
-    if foreground and foreground != target:
-        return _set_ime_conversion_mode(foreground, mode)
-    return False
-
-
-def _native_mode_matches(
-    target: int | None, foreground: int | None, expected_mode: int,
-) -> bool:
-    """Verify the native/alphanumeric bit after asking the IME to change it."""
-    observed = _get_mode_with_fallback(target, foreground)
-    return (
-        observed is not None
-        and (observed & config.IME_CMODE_NATIVE)
-        == (expected_mode & config.IME_CMODE_NATIVE)
+    conversion_mode = _query_ime_control(
+        target, config.IMC_GETCONVERSIONMODE,
+    )
+    open_value = _query_ime_control(target, config.IMC_GETOPENSTATUS)
+    return _InputState(
+        foreground=foreground,
+        target=target,
+        legacy_console=legacy_console,
+        language=language,
+        conversion_mode=conversion_mode,
+        open_status=bool(open_value) if open_value is not None else None,
     )
 
 
-def _ime_state_matches(
-    target: int | None,
-    foreground: int | None,
-    expected_mode: int,
-    expected_open_status: bool | None,
-) -> bool:
-    if not _native_mode_matches(target, foreground, expected_mode):
-        return False
-    if expected_open_status is None:
-        return True
-    observed_open_status = _get_open_status_with_fallback(target, foreground)
-    if observed_open_status is None:
-        return False
-    if expected_open_status is False:
-        # English is observable either as a closed IME or as an open IME with
-        # the native conversion bit cleared.
-        return True
-    return observed_open_status is True
+def _set_chinese_mode(state: _InputState) -> bool:
+    mode = state.conversion_mode or 0
+    opened = _set_ime_control(
+        state.target, config.IMC_SETOPENSTATUS, 1,
+    )
+    converted = _set_ime_control(
+        state.target,
+        config.IMC_SETCONVERSIONMODE,
+        mode | config.IME_CMODE_NATIVE,
+    )
+    return opened and converted
 
 
-def _post_layout_change(
-    target: int | None, foreground: int | None, new_hkl: int,
-) -> bool:
-    """Post to the focused input target first, then the top-level window."""
-    try:
-        if target and user32.PostMessageW(
-            target, config.WM_INPUTLANGCHANGEREQUEST, 0, new_hkl,
-        ):
-            return True
-        if foreground and foreground != target and user32.PostMessageW(
-            foreground, config.WM_INPUTLANGCHANGEREQUEST, 0, new_hkl,
-        ):
-            log.info("布局请求已回退到前台窗口 HWND=%s", foreground)
-            return True
-    except Exception as exc:
-        log.warning(
-            "布局切换请求失败 exception=%s",
-            type(exc).__name__,
+def _switch_legacy_console_ime(state: _InputState) -> bool:
+    if not state.legacy_console or state.language != config.LANGID_ZH_CN:
+        return False
+    if state.conversion_mode is None or state.open_status is None:
+        return False
+
+    if state.can_type_chinese:
+        # conhost must be closed once so its next automatic reopen retains
+        # alphanumeric mode instead of restoring native conversion.
+        _set_ime_control(
+            state.target,
+            config.IMC_SETCONVERSIONMODE,
+            state.conversion_mode & ~config.IME_CMODE_NATIVE,
         )
+        if _set_ime_control(state.target, config.IMC_SETOPENSTATUS, 0):
+            log.info("IME console mode change requested: Chinese to English")
+            return True
+        return False
+
+    if _set_chinese_mode(state):
+        log.info("IME console mode change requested: English to Chinese")
+        return True
     return False
 
 
-def _current_language(target: int | None) -> int | None:
-    if not target:
-        return None
-    thread_id = user32.GetWindowThreadProcessId(target, None)
-    if not thread_id:
-        return None
-    hkl = user32.GetKeyboardLayout(thread_id)
-    if not hkl:
-        return None
-    return hkl & 0xFFFF
+def _current_language(hwnd: int) -> int | None:
+    return _get_window_language(hwnd) or _get_ime_window_language(hwnd)
 
 
-def _is_microsoft_pinyin_context(
-    foreground: int | None, target: int | None,
+def _wait_for_language(hwnd: int, expected_language: int) -> bool:
+    deadline = time.monotonic() + _LANGUAGE_CHANGE_TIMEOUT_SECONDS
+    while True:
+        if _current_language(hwnd) == expected_language:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_LANGUAGE_CHANGE_POLL_SECONDS, remaining))
+
+
+def _request_layout_change(
+    target: int,
+    layout_name: str,
+    expected_language: int,
+    description: str,
 ) -> bool:
-    input_target = target or foreground
-    if not input_target:
-        return False
-    thread_id = user32.GetWindowThreadProcessId(input_target, None)
-    if not thread_id:
-        return False
-    hkl = user32.GetKeyboardLayout(thread_id)
-    if not hkl:
-        return False
-    description = ctypes.create_unicode_buffer(128)
-    if not imm32.ImmGetDescriptionW(hkl, description, len(description)):
-        log.info("微软拼音描述不可用，拒绝 IME 模式切换")
-        return False
-    value = " ".join(
-        unicodedata.normalize("NFKC", description.value).split(),
-    ).casefold()
-    if not value:
-        log.info("微软拼音描述为空，拒绝 IME 模式切换")
-        return False
-    if value in config.MICROSOFT_PINYIN_DESCRIPTION_ALLOWLIST:
-        return True
-    log.info("非微软拼音输入上下文，拒绝 IME 模式切换: %s", description.value)
-    return False
-
-
-def can_switch(mode: str) -> bool:
-    """Decide whether CapsLock should be consumed in the current context."""
-    try:
-        target, foreground = _input_targets()
-        language = _current_language(target or foreground)
-        if mode == "ime":
-            return (
-                language == config.LANGID_ZH_CN
-                and _is_microsoft_pinyin_context(foreground, target)
-            )
-        if mode == "layout":
-            return language in (config.LANGID_ZH_CN, config.LANGID_EN_US)
-        return False
-    except Exception as exc:
-        log.warning(
-            "无法确认当前输入上下文，拒绝切换 exception=%s",
-            type(exc).__name__,
-        )
-        return False
-
-
-def switch_ime(mode: str = "layout") -> bool:
-    try:
-        return _switch_ime(mode)
-    except Exception as exc:
-        log.warning(
-            "switch_ime failed mode=%s exception=%s",
-            mode,
-            type(exc).__name__,
-        )
-        return False
-
-
-def _switch_ime(mode: str) -> bool:
-    """Switch using the selected strategy; return whether a change was sent."""
-    target, foreground = _input_targets()
-    language = _current_language(target or foreground)
-    if foreground is None or language is None:
-        log.warning("switch_ime: no usable foreground window")
-        return False
-
-    if mode == "ime":
-        if (
-            language != config.LANGID_ZH_CN
-            or not _is_microsoft_pinyin_context(foreground, target)
-        ):
-            return False
-        current = _get_mode_with_fallback(target, foreground)
-        if current is not None:
-            open_status = _get_open_status_with_fallback(target, foreground)
-            if open_status is None:
-                log.warning("微软拼音打开状态不可读，拒绝切换")
-                return False
-            currently_chinese = bool(
-                open_status and (current & config.IME_CMODE_NATIVE),
-            )
-            desired_chinese = not currently_chinese
-            new_mode = (
-                current | config.IME_CMODE_NATIVE
-                if desired_chinese
-                else current & ~config.IME_CMODE_NATIVE
-            )
-            expected_open_status = desired_chinese
-
-            if expected_open_status is True:
-                open_written = _set_open_status_with_fallback(
-                    target, foreground, True,
-                )
-                mode_written = _set_mode_with_fallback(
-                    target, foreground, new_mode,
-                )
-            else:
-                mode_written = _set_mode_with_fallback(
-                    target, foreground, new_mode,
-                )
-                open_written = (
-                    expected_open_status is False
-                    and _set_open_status_with_fallback(
-                        target, foreground, False,
-                    )
-                )
-            if (
-                mode_written
-                and (
-                    expected_open_status is None
-                    or open_written
-                )
-                and _ime_state_matches(
-                    target,
-                    foreground,
-                    new_mode,
-                    expected_open_status,
-                )
-            ):
-                log.info("微软拼音内部模式已切换")
-                return True
-            log.warning("微软拼音切换结果未确认，已取消本次切换")
-        else:
-            log.warning("微软拼音转换模式不可读，已取消本次切换")
-        return False
-
-    if mode != "layout" or language not in (
-        config.LANGID_ZH_CN,
-        config.LANGID_EN_US,
-    ):
-        return False
-
-    if language == config.LANGID_ZH_CN:
-        new_hkl = user32.LoadKeyboardLayoutW(
-            config.LAYOUT_EN_US, config.KLF_NOTELLSHELL,
-        )
-        if not new_hkl or not _post_layout_change(target, foreground, new_hkl):
-            log.warning("无法切换到英文键盘布局")
-            return False
-        log.info("键盘布局已切换: 中 → En")
-        return True
-
     new_hkl = user32.LoadKeyboardLayoutW(
-        config.LAYOUT_ZH_CN, config.KLF_NOTELLSHELL,
+        layout_name, config.KLF_NOTELLSHELL,
     )
     if not new_hkl:
-        log.warning("LoadKeyboardLayout(%s) 失败", config.LAYOUT_ZH_CN)
+        log.warning("LoadKeyboardLayout(%s) failed", layout_name)
         return False
-    if not _post_layout_change(target, foreground, new_hkl):
-        log.warning("无法切换到中文键盘布局")
+    if not user32.PostMessageW(
+        target, config.WM_INPUTLANGCHANGEREQUEST, 0, new_hkl,
+    ):
+        log.warning("IME layout change request failed: %s", description)
         return False
-    log.info("键盘布局已切换: En → 中")
-    return True
-
-
-def get_ime_status() -> bool:
-    """Return whether the foreground context can currently type Chinese."""
-    target, foreground = _input_targets()
-    if _current_language(target or foreground) != config.LANGID_ZH_CN:
-        return False
-    mode = _get_mode_with_fallback(target, foreground)
-    if mode is None:
+    if _wait_for_language(target, expected_language):
+        log.info("IME layout changed: %s", description)
         return True
-    open_status = _get_open_status_with_fallback(target, foreground)
-    if open_status is False:
-        return False
-    return bool(mode & config.IME_CMODE_NATIVE)
+    log.warning("IME layout change timed out: %s", description)
+    return False
+
+
+def set_switching_method(method: SwitchingMethod) -> None:
+    """Select the behavior used by subsequent CapsLock presses."""
+    global _active_switching_method
+    _active_switching_method = method
+
+
+def switch_ime() -> None:
+    """Apply the configured CapsLock switching behavior."""
+    if _active_switching_method is SwitchingMethod.MICROSOFT_PINYIN_MODE:
+        _switch_microsoft_pinyin_mode()
+    else:
+        _switch_keyboard_layouts()
+
+
+def _switch_microsoft_pinyin_mode() -> None:
+    state = _resolve_input_state()
+    if state is None:
+        log.warning("Pinyin mode switch skipped: no foreground window")
+        return
+    if state.language != config.LANGID_ZH_CN:
+        log.warning(
+            "Pinyin mode switch skipped: Simplified Chinese is not active"
+        )
+        return
+    if state.conversion_mode is None:
+        log.warning(
+            "Pinyin mode switch unsupported: conversion mode is unavailable"
+        )
+        return
+
+    was_native = bool(state.conversion_mode & config.IME_CMODE_NATIVE)
+    if was_native:
+        # Microsoft Pinyin uses 0x401 for Chinese on current Windows builds.
+        # Clearing only IME_CMODE_NATIVE produces 0x400, which it rejects and
+        # normalizes back to Chinese. English must be requested as mode 0.
+        requested_mode = config.IME_CMODE_ALPHANUMERIC
+        description = "Chinese to English"
+    else:
+        requested_mode = config.IME_CMODE_NATIVE
+        description = "English to Chinese"
+
+    if not _set_ime_control(
+        state.target,
+        config.IMC_SETCONVERSIONMODE,
+        requested_mode,
+    ):
+        log.warning("Pinyin mode switch request failed: %s", description)
+        return
+
+    # SendMessage is synchronous, but Microsoft Pinyin normalizes conversion
+    # modes asynchronously. Verify after that normalization can occur.
+    time.sleep(_IME_MODE_SETTLE_SECONDS)
+    confirmed_mode = _query_ime_control(
+        state.target, config.IMC_GETCONVERSIONMODE,
+    )
+    if confirmed_mode is None:
+        log.warning("Pinyin mode switch could not be verified: %s", description)
+        return
+    if bool(confirmed_mode & config.IME_CMODE_NATIVE) == was_native:
+        log.warning("Pinyin mode switch was not applied: %s", description)
+        return
+    log.info("Microsoft Pinyin mode changed: %s", description)
+
+
+def _switch_keyboard_layouts() -> None:
+    """Toggle the effective foreground input state between English and Chinese."""
+    state = _resolve_input_state()
+    if state is None:
+        log.warning("switch_ime: no foreground window")
+        return
+    if state.language is None:
+        log.warning("switch_ime: unable to determine the foreground input language")
+        return
+    if _switch_legacy_console_ime(state):
+        return
+
+    if state.language == config.LANGID_ZH_CN:
+        if not state.can_type_chinese and state.conversion_mode is not None:
+            if _set_chinese_mode(state):
+                log.info("IME mode set to Chinese")
+            return
+        _request_layout_change(
+            state.target,
+            config.LAYOUT_EN_US,
+            config.LANGID_EN_US,
+            "Chinese to English",
+        )
+        return
+
+    if _request_layout_change(
+        state.target,
+        config.LAYOUT_ZH_CN,
+        config.LANGID_ZH_CN,
+        "English to Chinese",
+    ):
+        refreshed = _resolve_input_state(state.foreground)
+        if refreshed is not None:
+            _set_chinese_mode(refreshed)
