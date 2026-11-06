@@ -36,15 +36,41 @@ class _Win32LED:
         from .winapi import user32
         from . import config
         if user32.GetKeyState(config.VK_CAPITAL) & 1:
-            user32.keybd_event(config.VK_CAPITAL, 0, 0, 0)
-            user32.keybd_event(config.VK_CAPITAL, 0, config.KEYEVENTF_KEYUP, 0)
+            self._tap_capslock()
 
     def on(self) -> None:
         from .winapi import user32
         from . import config
         if not (user32.GetKeyState(config.VK_CAPITAL) & 1):
-            user32.keybd_event(config.VK_CAPITAL, 0, 0, 0)
-            user32.keybd_event(config.VK_CAPITAL, 0, config.KEYEVENTF_KEYUP, 0)
+            self._tap_capslock()
+
+    @staticmethod
+    def _tap_capslock() -> None:
+        """Inject one CapsLock down+up pair with a single SendInput call."""
+        import ctypes
+
+        from . import config
+        from .winapi import INPUT, INPUT_KEYBOARD, KEYBDINPUT, user32
+
+        events = (INPUT * 2)()
+        for event, flags in zip(
+            events, (0, config.KEYEVENTF_KEYUP), strict=True
+        ):
+            event.type = INPUT_KEYBOARD
+            event.ki = KEYBDINPUT(
+                wVk=config.VK_CAPITAL,
+                wScan=0,
+                dwFlags=flags,
+                time=0,
+                dwExtraInfo=0,
+            )
+
+        sent = user32.SendInput(len(events), events, ctypes.sizeof(INPUT))
+        if sent != len(events):
+            raise OSError(
+                f"SendInput injected {sent} of {len(events)} CapsLock events "
+                f"(Windows error {ctypes.get_last_error()})"
+            )
 
 
 # ── Engine ───────────────────────────────────────────────────
@@ -95,7 +121,6 @@ class CapsLockIME:
     def _on_down(self) -> bool:
         if self._uppercase_mode:
             self._uppercase_mode = False
-            self._dispatch(self._led.off)
             return False  # pass through — let OS turn CapsLock off
 
         if not self._main_lock.acquire(blocking=False):

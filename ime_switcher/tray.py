@@ -1,11 +1,13 @@
-"""System-tray icon, menu, and registry auto-start."""
+"""System-tray icon, menu, and startup-management entry points."""
 
 import logging
 import os
 import sys
-import winreg
+from dataclasses import replace
 
 from . import config
+from .autostart import WindowsStartup
+from .settings_store import load_preferences, save_preferences
 
 log = logging.getLogger(__name__)
 
@@ -23,56 +25,28 @@ def _make_tray_image():
     return ico.resize((64, 64), Image.LANCZOS)
 
 
-# ── Auto-start (registry) ─────────────────────────────────
-
-def _exe_path() -> str:
-    if getattr(sys, 'frozen', False):
-        return f'"{sys.executable}"'
-    # Running from source — reconstruct the invocation.
-    main = os.path.abspath(os.path.join(os.path.dirname(__file__), "__main__.py"))
-    return f'"{sys.executable}" "{main}"'
-
+# ── Auto-start ───────────────────────────────────────────
 
 def is_autostart_enabled() -> bool:
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, config.REG_RUN_KEY, 0, winreg.KEY_READ,
-        ) as key:
-            value, value_type = winreg.QueryValueEx(key, config.APP_NAME)
-        return value_type == winreg.REG_SZ and value == _exe_path()
-    except FileNotFoundError:
-        return False
+    return WindowsStartup().is_enabled()
 
 
 def install_autostart() -> None:
-    path = _exe_path()
-    with winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER, config.REG_RUN_KEY, 0, winreg.KEY_SET_VALUE,
-    ) as key:
-        winreg.SetValueEx(key, config.APP_NAME, 0, winreg.REG_SZ, path)
-    log.info("Auto-start installed: %s", path)
-    print(f"已添加开机自启: {path}")
+    preferences = load_preferences()
+    set_autostart_enabled(True, preferences.run_as_administrator)
+    save_preferences(replace(preferences, autostart=True))
 
 
 def remove_autostart() -> None:
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, config.REG_RUN_KEY, 0, winreg.KEY_SET_VALUE,
-        ) as key:
-            winreg.DeleteValue(key, config.APP_NAME)
-        log.info("Auto-start removed")
-        print("已移除开机自启")
-    except FileNotFoundError:
-        pass
+    preferences = load_preferences()
+    set_autostart_enabled(False, preferences.run_as_administrator)
+    save_preferences(replace(preferences, autostart=False))
 
 
 # ── Menu builder ──────────────────────────────────────────
 
-def set_autostart_enabled(enabled: bool) -> None:
-    if enabled:
-        install_autostart()
-    else:
-        remove_autostart()
+def set_autostart_enabled(enabled: bool, administrator: bool = False) -> None:
+    WindowsStartup().apply(enabled, administrator)
 
 
 def build_menu(on_open_settings, on_quit):

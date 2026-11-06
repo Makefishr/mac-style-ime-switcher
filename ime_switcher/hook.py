@@ -2,7 +2,7 @@
 
 import ctypes
 import logging
-import time
+import threading
 from ctypes import wintypes
 
 from . import config
@@ -13,7 +13,15 @@ log = logging.getLogger(__name__)
 
 
 # ── Shortcut-blocking state ──────────────────────────────────
-_mod_ctrl_down = False
+_CTRL_KEYS = {config.VK_CONTROL, config.VK_LCONTROL, config.VK_RCONTROL}
+_SHIFT_ALT_KEYS = {config.VK_SHIFT, 0xA0, 0xA1, config.VK_MENU, 0xA4, 0xA5}
+_modifiers_down: set[int] = set()
+_block_ctrl_space = True
+
+
+def set_block_ctrl_space(enabled: bool) -> None:
+    global _block_ctrl_space
+    _block_ctrl_space = enabled
 
 
 # ── Keyboard hook ────────────────────────────────────────────
@@ -21,8 +29,6 @@ _mod_ctrl_down = False
 
 @HOOKPROC
 def _keyboard_hook(nCode: int, wParam: int, lParam: int) -> int:
-    global _mod_ctrl_down
-
     if nCode < 0:
         return user32.CallNextHookEx(
             config.hook_handle, nCode, wParam, lParam,
@@ -38,11 +44,12 @@ def _keyboard_hook(nCode: int, wParam: int, lParam: int) -> int:
             config.hook_handle, nCode, wParam, lParam,
         )
 
-    # Track Ctrl state ourselves — more reliable than GetAsyncKeyState.
-    if is_down and vk in (config.VK_CONTROL, config.VK_LCONTROL, config.VK_RCONTROL):
-        _mod_ctrl_down = True
-    elif not is_down and vk in (config.VK_CONTROL, config.VK_LCONTROL, config.VK_RCONTROL):
-        _mod_ctrl_down = False
+    # Keep the two sides separate so releasing one Ctrl does not clear the other.
+    if vk in _CTRL_KEYS or vk in _SHIFT_ALT_KEYS:
+        if is_down:
+            _modifiers_down.add(vk)
+        else:
+            _modifiers_down.discard(vk)
 
     # ── CapsLock: delegate to the deep module ──
     if engine.on_key_event(vk, is_down):
@@ -58,11 +65,11 @@ def _keyboard_hook(nCode: int, wParam: int, lParam: int) -> int:
         is_key_down(config.VK_LWIN) or is_key_down(config.VK_RWIN)
     ):
         return 1
-    if vk == config.VK_SPACE and _mod_ctrl_down:
-        return 1
-    if vk == config.VK_SHIFT and _mod_ctrl_down:
-        return 1
-    if vk == config.VK_SHIFT and is_key_down(config.VK_MENU):
+    if (vk == config.VK_SPACE and _block_ctrl_space
+            and _modifiers_down & _CTRL_KEYS
+            and not _modifiers_down & _SHIFT_ALT_KEYS
+            and not is_key_down(config.VK_SHIFT)
+            and not is_key_down(config.VK_MENU)):
         return 1
 
     return user32.CallNextHookEx(
@@ -73,27 +80,100 @@ def _keyboard_hook(nCode: int, wParam: int, lParam: int) -> int:
 # ── Hook thread ──────────────────────────────────────────────
 
 
-def hook_thread_main() -> None:
-    """Install the low-level keyboard hook and run the message loop."""
-    module = kernel32.GetModuleHandleW(None)
-    ptr = user32.SetWindowsHookExW(
-        config.WH_KEYBOARD_LL, _keyboard_hook, module, 0,
-    )
-    if not ptr:
-        err = ctypes.get_last_error()
-        log.error("SetWindowsHookExW failed (error %d)", err)
-        return
-    config.hook_handle = ptr
-    log.info("Keyboard hook installed (handle=%s)", config.hook_handle)
+WM_QUIT = 0x0012
+WM_TIMER = 0x0113
+WM_USER = 0x0400
+ERROR_INVALID_HOOK_HANDLE = 1404
+HOOK_REFRESH_MS = 60_000
 
-    msg = wintypes.MSG()
-    while config.running:
-        if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, config.PM_REMOVE):
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-        else:
-            time.sleep(0.005)
 
-    user32.UnhookWindowsHookEx(config.hook_handle)
-    config.hook_handle = None
-    log.info("Keyboard hook uninstalled")
+class HookLoop:
+    """Own the hook, timer and message queue on one dedicated thread."""
+
+    def __init__(self, api=user32, kernel=kernel32):
+        self.ready = threading.Event()
+        self.installed = False
+        self._api = api
+        self._kernel = kernel
+        self._stop_requested = threading.Event()
+        self._state_lock = threading.Lock()
+        self._thread_id = None
+        self._handle = None
+
+    def stop(self) -> bool:
+        self._stop_requested.set()
+        with self._state_lock:
+            if self._thread_id is None:
+                return True
+            posted = bool(self._api.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0))
+            if not posted:
+                log.error("Unable to stop hook thread (error %d)", ctypes.get_last_error())
+            return posted
+
+    def _install(self) -> None:
+        # Releases may have happened while the hook was absent. Seed only the
+        # side-specific keys, since those are the codes delivered by WH_KEYBOARD_LL.
+        _modifiers_down.clear()
+        _modifiers_down.update(vk for vk in (config.VK_LCONTROL, config.VK_RCONTROL,
+                                            0xA0, 0xA1, 0xA4, 0xA5) if is_key_down(vk))
+        self._handle = self._api.SetWindowsHookExW(
+            config.WH_KEYBOARD_LL, _keyboard_hook,
+            self._kernel.GetModuleHandleW(None), 0,
+        )
+        config.hook_handle = self._handle
+        self.installed = bool(self._handle)
+        if not self.installed:
+            log.error("SetWindowsHookExW failed (error %d)", ctypes.get_last_error())
+
+    def _uninstall(self) -> bool:
+        if self._handle:
+            ctypes.set_last_error(0)
+            removed = self._api.UnhookWindowsHookEx(self._handle)
+            if not removed and ctypes.get_last_error() != ERROR_INVALID_HOOK_HANDLE:
+                # An unknown failure may leave a live hook. Never install a duplicate.
+                log.error("UnhookWindowsHookEx failed (error %d)", ctypes.get_last_error())
+                return False
+        self._handle = None
+        config.hook_handle = None
+        self.installed = False
+        return True
+
+    def run(self) -> None:
+        msg = wintypes.MSG()
+        timer_id = 0
+        try:
+            # PostThreadMessage requires a queue. Publish the ID only after creating it.
+            self._api.PeekMessageW(ctypes.byref(msg), None, WM_USER, WM_USER, 0)
+            with self._state_lock:
+                self._thread_id = self._kernel.GetCurrentThreadId()
+            if self._stop_requested.is_set():
+                return
+            self._install()
+            if not self.installed:
+                return
+            timer_id = self._api.SetTimer(None, 0, HOOK_REFRESH_MS, None)
+            if not timer_id:
+                log.error("Unable to start hook recovery timer (error %d)", ctypes.get_last_error())
+                return
+            self.ready.set()
+            while not self._stop_requested.is_set():
+                result = self._api.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result == -1:
+                    log.error("GetMessageW failed (error %d)", ctypes.get_last_error())
+                    break
+                if result == 0:
+                    break
+                if msg.message == WM_TIMER and msg.wParam == timer_id:
+                    if self._uninstall():
+                        self._install()
+                else:
+                    self._api.TranslateMessage(ctypes.byref(msg))
+                    self._api.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            with self._state_lock:
+                self._thread_id = None
+            if timer_id:
+                self._api.KillTimer(None, timer_id)
+            self._uninstall()
+            self.ready.set()
+            log.info("Keyboard hook thread stopped")

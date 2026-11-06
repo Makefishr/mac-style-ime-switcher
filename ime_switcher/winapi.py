@@ -19,6 +19,54 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx",          wintypes.LONG),
+        ("dy",          wintypes.LONG),
+        ("mouseData",   wintypes.DWORD),
+        ("dwFlags",     wintypes.DWORD),
+        ("time",        wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk",         wintypes.WORD),
+        ("wScan",       wintypes.WORD),
+        ("dwFlags",     wintypes.DWORD),
+        ("time",        wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg",    wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("u", _INPUTUNION),
+    ]
+
+
+INPUT_KEYBOARD = 1
+
+
 class GUITHREADINFO(ctypes.Structure):
     _fields_ = [
         ("cbSize",       wintypes.DWORD),
@@ -94,10 +142,10 @@ user32.GetAsyncKeyState.restype = wintypes.SHORT
 user32.GetKeyState.argtypes = [ctypes.c_int]
 user32.GetKeyState.restype = wintypes.SHORT
 
-user32.keybd_event.argtypes = [
-    wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_ulonglong,
+user32.SendInput.argtypes = [
+    wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int,
 ]
-user32.keybd_event.restype = None
+user32.SendInput.restype = wintypes.UINT
 
 # ═══════════════════════════════════════════════════════════
 #  Message loop (hook thread)
@@ -221,3 +269,26 @@ user32.SendMessageTimeoutW.restype = wintypes.LPARAM
 
 def is_key_down(vk: int) -> bool:
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+# Blocking hook message loop, recovery timer and language shortcut refresh.
+user32.GetMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+]
+user32.GetMessageW.restype = ctypes.c_int
+user32.PostThreadMessageW.argtypes = [
+    wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+]
+user32.PostThreadMessageW.restype = wintypes.BOOL
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p]
+user32.SetTimer.restype = ctypes.c_size_t
+user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+user32.KillTimer.restype = wintypes.BOOL
+user32.SystemParametersInfoW.argtypes = [
+    wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT,
+]
+user32.SystemParametersInfoW.restype = wintypes.BOOL
+kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL

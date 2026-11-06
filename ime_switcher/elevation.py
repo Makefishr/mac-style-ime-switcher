@@ -26,6 +26,9 @@ WAIT_OBJECT_0 = 0x00000000
 WAIT_TIMEOUT = 0x00000102
 WAIT_FAILED = 0xFFFFFFFF
 HANDOFF_TIMEOUT_MS = 30_000
+# Internal marker: the elevated CLI child must not print its own success line,
+# because the waiting parent prints it once for the user's console.
+CLI_CHILD_FLAG = "--elevated-cli-child"
 _READY_EVENT_PREFIX = f"Local\\{config.APP_NAME}.ElevationReady."
 
 
@@ -150,12 +153,31 @@ def _new_ready_event_name() -> str:
     return f"{_READY_EVENT_PREFIX}{os.getpid()}.{uuid.uuid4().hex}"
 
 
+def run_elevated_command(arguments: list[str]) -> None:
+    """Run a startup-management command with UAC and report the child result."""
+    launch = _launch_elevated([*arguments, CLI_CHILD_FLAG])
+    if launch.status is HandoffStatus.CANCELLED:
+        raise OSError("已取消管理员权限请求；登录自启未更改")
+    if launch.status is not HandoffStatus.READY:
+        raise OSError(f"管理员权限请求未完成：{launch.status.value} ({launch.error_code})")
+    try:
+        if kernel32.WaitForSingleObject(launch.process_handle, HANDOFF_TIMEOUT_MS) != WAIT_OBJECT_0:
+            raise OSError("管理员命令尚未确认完成，请查看启动设置或日志")
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(launch.process_handle, ctypes.byref(code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if code.value:
+            raise OSError(f"管理员命令失败（退出代码 {code.value}），请查看日志")
+    finally:
+        kernel32.CloseHandle(launch.process_handle)
+
+
 def _restart_command(arguments: list[str]) -> tuple[str, str]:
     if getattr(sys, "frozen", False):
         return sys.executable, subprocess.list2cmdline(arguments)
 
     script = os.path.abspath(sys.argv[0])
-    return sys.executable, subprocess.list2cmdline([script, *arguments])
+    return config.source_executable(), subprocess.list2cmdline([script, *arguments])
 
 
 def _launch_elevated(arguments: list[str]) -> _LaunchResult:

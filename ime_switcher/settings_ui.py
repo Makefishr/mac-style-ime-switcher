@@ -19,13 +19,15 @@ class SettingsWindow:
     def __init__(
         self,
         root: tk.Tk,
-        on_save: Callable[[bool, bool, SwitchingMethod], bool],
+        on_save: Callable[[bool, bool, SwitchingMethod, bool, bool], bool],
     ) -> None:
         self._root = root
         self._on_save = on_save
         self._window: tk.Toplevel | None = None
         self._run_as_admin = tk.BooleanVar(master=root)
         self._autostart = tk.BooleanVar(master=root)
+        self._disable_system_hotkeys = tk.BooleanVar(master=root)
+        self._block_ctrl_space = tk.BooleanVar(master=root)
         self._switching_method = tk.StringVar(master=root)
         self._status = tk.StringVar(master=root)
         self._save_button: ttk.Button | None = None
@@ -46,8 +48,13 @@ class SettingsWindow:
     def refresh_effective_state(self) -> None:
         preferences = load_preferences()
         self._run_as_admin.set(preferences.run_as_administrator)
-        self._autostart.set(tray.is_autostart_enabled())
+        self._autostart.set(
+            tray.is_autostart_enabled() if preferences.autostart is None
+            else preferences.autostart
+        )
         self._switching_method.set(preferences.switching_method.value)
+        self._disable_system_hotkeys.set(preferences.disable_system_hotkeys)
+        self._block_ctrl_space.set(preferences.block_ctrl_space)
         mode = "管理员模式" if elevation.is_elevated() else "普通模式"
         self._status.set(f"当前运行：{mode}")
 
@@ -116,8 +123,30 @@ class SettingsWindow:
             variable=self._autostart,
         ).grid(row=0, column=0, sticky="w")
 
+        ttk.Label(
+            startup_frame,
+            text="管理员模式使用登录计划任务；首次配置需要 UAC，后续登录无需确认。",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        shortcuts = ttk.LabelFrame(outer, text="快捷键", padding=(12, 10))
+        shortcuts.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        ttk.Checkbutton(
+            shortcuts, text="关闭系统 Ctrl+Shift / Alt+Shift 语言切换",
+            variable=self._disable_system_hotkeys,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            shortcuts,
+            text="关闭此选项会恢复原设置；若未生效，请注销后重新登录。",
+        ).grid(row=1, column=0, sticky="w", padx=(20, 0), pady=(2, 8))
+        ttk.Checkbutton(
+            shortcuts, text="拦截 Ctrl+Space", variable=self._block_ctrl_space,
+        ).grid(row=2, column=0, sticky="w")
+        ttk.Label(
+            shortcuts, text="取消后可在编辑器中使用 Ctrl+Space 代码补全；Win+Space 始终拦截。",
+        ).grid(row=3, column=0, sticky="w", padx=(20, 0), pady=(2, 0))
+
         buttons = ttk.Frame(outer)
-        buttons.grid(row=3, column=0, sticky="e", pady=(16, 0))
+        buttons.grid(row=4, column=0, sticky="e", pady=(16, 0))
         ttk.Button(buttons, text="取消", command=self._cancel).grid(row=0, column=0)
         self._save_button = ttk.Button(buttons, text="保存", command=self._save)
         self._save_button.grid(row=0, column=1, padx=(8, 0))
@@ -141,6 +170,8 @@ class SettingsWindow:
                 self._run_as_admin.get(),
                 self._autostart.get(),
                 SwitchingMethod(self._switching_method.get()),
+                self._disable_system_hotkeys.get(),
+                self._block_ctrl_space.get(),
             )
             self.refresh_effective_state()
             if should_close:

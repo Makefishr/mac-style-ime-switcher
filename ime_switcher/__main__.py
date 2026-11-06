@@ -6,9 +6,9 @@ import os
 import queue
 import sys
 import threading
-import time
 import tkinter as tk
 from collections.abc import Callable
+from dataclasses import replace
 from enum import Enum
 from tkinter import messagebox
 
@@ -26,6 +26,8 @@ from ime_switcher.settings_store import (
     save_preferences,
 )
 from ime_switcher.settings_ui import SettingsWindow
+from ime_switcher.autostart import WindowsStartup
+from ime_switcher.system_hotkeys import LanguageHotkeys
 from ime_switcher.winapi import kernel32
 
 log = logging.getLogger(__name__)
@@ -43,7 +45,7 @@ class _RuntimeAction(Enum):
 
 
 def _mutex_name() -> str:
-    return f"Global\\{config.APP_NAME}_SingleInstance_{config.VERSION}"
+    return f"Global\\{config.APP_NAME}_SingleInstance"
 
 
 def _acquire_single_instance(wait_ms: int = 0):
@@ -86,6 +88,55 @@ class _DesktopRuntime:
         self._tray_started_ok = False
         self._action = _RuntimeAction.QUIT
         self._settings = SettingsWindow(self._root, self._apply_settings)
+        self._hook_loop = hook.HookLoop()
+
+    def _prepare_settings(self) -> None:
+        preferences = load_preferences()
+        if preferences.autostart is None:
+            try:
+                preferences = replace(preferences, autostart=WindowsStartup().is_enabled())
+                save_preferences(preferences)
+            except OSError as exc:
+                log.exception("Unable to migrate startup registration")
+                self._append_startup_notice(f"无法读取原有登录自启（{exc}），请在设置中重新保存。")
+        for notice in self._apply_preferences(preferences, request_elevation=False):
+            self._append_startup_notice(notice)
+
+    def _apply_preferences(self, preferences: Preferences, *, request_elevation: bool) -> list[str]:
+        """Apply independent preferences and report precisely which parts failed."""
+        notices = []
+        toggle.set_switching_method(preferences.switching_method)
+        hook.set_block_ctrl_space(preferences.block_ctrl_space)
+        try:
+            if not LanguageHotkeys().apply(preferences.disable_system_hotkeys):
+                notices.append("系统语言快捷键已写入，但 Windows 未能重新载入；请注销后重新登录。")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            log.exception("Unable to update system language shortcuts")
+            notices.append(f"系统语言快捷键未能完整应用：{str(exc).rstrip('。')}。请修复后重新保存设置。")
+        try:
+            startup = WindowsStartup()
+            needs_elevation = request_elevation and preferences.run_as_administrator and not elevation.is_elevated()
+            if preferences.autostart is not None:
+                if not startup.is_configured(preferences.autostart, preferences.run_as_administrator):
+                    if needs_elevation or startup.needs_elevation(preferences.autostart, preferences.run_as_administrator):
+                        needs_elevation = True
+                    else:
+                        startup.apply(preferences.autostart, preferences.run_as_administrator)
+            if needs_elevation:
+                if request_elevation:
+                    self._request_elevation()
+                else:
+                    notices.append("登录自启设置尚未应用：需要管理员权限，请在设置中重新保存。")
+        except OSError as exc:
+            log.exception("Unable to update startup registration")
+            notices.append(f"登录自启尚未确认应用：{exc}。偏好已保留，请在设置中重新保存。")
+            # A scheduler failure must not prevent the independently requested mode change.
+            if request_elevation and preferences.run_as_administrator and not elevation.is_elevated():
+                self._request_elevation()
+        return notices
+
+    def _append_startup_notice(self, message: str) -> None:
+        self._startup_notice = f"{self._startup_notice or ''} {message}".strip()
 
     def run(
         self,
@@ -96,21 +147,15 @@ class _DesktopRuntime:
         config.running = True
         config.hook_handle = None
         try:
+            self._prepare_settings()
             self._hook_thread = threading.Thread(
-                target=hook.hook_thread_main,
+                target=self._hook_loop.run,
                 daemon=True,
                 name="Hook",
             )
             self._hook_thread.start()
-            hook_deadline = time.monotonic() + HOOK_READY_TIMEOUT_SECONDS
-            while (
-                not config.hook_handle
-                and self._hook_thread.is_alive()
-                and time.monotonic() < hook_deadline
-            ):
-                time.sleep(0.01)
-
-            if not config.hook_handle:
+            hook_ready = self._hook_loop.ready.wait(HOOK_READY_TIMEOUT_SECONDS)
+            if not hook_ready or not self._hook_loop.installed:
                 log.error("Hook installation failed — exiting")
                 messagebox.showerror(
                     "Mac-style IME Switcher",
@@ -157,6 +202,7 @@ class _DesktopRuntime:
             return self._action
         finally:
             config.running = False
+            self._hook_loop.stop()
             if self._icon is not None:
                 self._icon.stop()
             if self._hook_thread is not None:
@@ -221,42 +267,40 @@ class _DesktopRuntime:
         run_as_administrator: bool,
         autostart: bool,
         switching_method: SwitchingMethod,
+        disable_system_hotkeys: bool,
+        block_ctrl_space: bool,
     ) -> bool:
-        try:
-            tray.set_autostart_enabled(autostart)
-        except OSError as exc:
-            log.exception("Unable to update the HKCU Run entry")
-            self._notify(f"无法更新开机启动设置（{exc}）。请重试或查看日志。")
-            return False
-
-        if run_as_administrator and not elevation.is_elevated():
-            try:
-                save_preferences(
-                    Preferences(
-                        run_as_administrator=True,
-                        switching_method=switching_method,
-                    )
-                )
-            except OSError as exc:
-                log.exception("Unable to save administrator preference")
-                self._notify(
-                    f"无法保存管理员模式设置（{exc}）。MacStyleIME 继续以普通模式运行。"
-                )
-                return False
-            toggle.set_switching_method(switching_method)
-            self._request_elevation()
-            return True
-
-        save_preferences(
-            Preferences(
-                run_as_administrator=run_as_administrator,
-                switching_method=switching_method,
-            )
+        preferences = Preferences(
+            run_as_administrator=run_as_administrator,
+            switching_method=switching_method,
+            disable_system_hotkeys=disable_system_hotkeys,
+            block_ctrl_space=block_ctrl_space,
+            autostart=autostart,
         )
-        toggle.set_switching_method(switching_method)
+        save_preferences(preferences)
+        notices = self._apply_preferences(preferences, request_elevation=True)
+        if notices:
+            messagebox.showwarning(
+                "设置已保存，部分尚未生效", "\n\n".join(notices), parent=self._root,
+            )
         if elevation.is_elevated() and not run_as_administrator:
             self._notify("设置已保存；下次启动将使用普通模式。")
         return True
+
+
+_UNINSTALL_MESSAGE = (
+    "已移除登录自启。正在运行的 MacStyleIME 不受影响，"
+    '如需退出请在托盘图标菜单中选择"退出"。'
+)
+
+
+def _startup_cli_message(cmd: str, preferences: Preferences) -> str:
+    """Return the success line for an applied --install/--uninstall command."""
+    if cmd == "--uninstall":
+        return _UNINSTALL_MESSAGE
+    if preferences.run_as_administrator:
+        return "已添加登录自启（管理员模式：计划任务）。"
+    return "已添加登录自启（普通模式：启动项）。"
 
 
 def _handle_cli(arguments: list[str]) -> bool:
@@ -264,15 +308,36 @@ def _handle_cli(arguments: list[str]) -> bool:
         return False
 
     cmd = arguments[0].lower()
-    if cmd == "--install":
-        tray.install_autostart()
-    elif cmd == "--uninstall":
-        tray.remove_autostart()
+    if cmd in ("--install", "--uninstall"):
+        # The elevated child has no console and its parent prints the result.
+        report_result = elevation.CLI_CHILD_FLAG not in arguments[1:]
+        try:
+            preferences = load_preferences()
+            enabled = cmd == "--install"
+            startup = WindowsStartup()
+            if (not startup.is_configured(enabled, preferences.run_as_administrator)
+                    and startup.needs_elevation(enabled, preferences.run_as_administrator)):
+                elevation.run_elevated_command([cmd])
+            elif enabled:
+                tray.install_autostart()
+            else:
+                tray.remove_autostart()
+        except OSError as exc:
+            log.error("Startup command failed: %s", exc)
+            message = f"登录自启操作未完成：{exc}。请重试或查看日志。"
+            print(message, file=sys.stderr)
+            # The waiting parent shows the single dialog; the elevated child
+            # must not duplicate it.
+            if getattr(sys, "frozen", False) and report_result:
+                messagebox.showerror("登录自启操作未完成", message)
+            raise SystemExit(1) from None
+        if report_result:
+            print(_startup_cli_message(cmd, preferences))
     elif cmd in ("--help", "-h"):
         print(__doc__ or "")
         print(f"Mac-style IME Switcher v{config.VERSION}")
-        print("  --install    添加开机自启")
-        print("  --uninstall  移除开机自启")
+        print("  --install    按管理员模式设置添加登录自启（必要时请求 UAC）")
+        print("  --uninstall  移除启动项和登录任务（必要时请求 UAC）")
         print("  --help       显示此帮助")
     else:
         print(f"未知命令: {cmd}")
@@ -384,10 +449,7 @@ def main() -> None:
             rollback_failed = False
             try:
                 save_preferences(
-                    Preferences(
-                        run_as_administrator=False,
-                        switching_method=load_preferences().switching_method,
-                    )
+                    replace(load_preferences(), run_as_administrator=False)
                 )
             except OSError:
                 rollback_failed = True

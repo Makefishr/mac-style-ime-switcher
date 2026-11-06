@@ -43,14 +43,14 @@ def quick_tap(engine):
 
 class TestNonCapsLockKey(unittest.TestCase):
     def test_non_capslock_key_returns_false(self):
-        engine = CapsLockIME()
+        engine = CapsLockIME(ime_adapter=FakeIME(), led_adapter=FakeLED())
         self.assertFalse(engine.on_key_event(0x41, True))
         self.assertFalse(engine.on_key_event(0x41, False))
 
 
 class TestShortPress(unittest.TestCase):
     def test_short_press_eats_both_events(self):
-        engine = CapsLockIME()
+        engine = CapsLockIME(ime_adapter=FakeIME(), led_adapter=FakeLED())
         down_eaten, up_eaten = quick_tap(engine)
         self.assertTrue(down_eaten)
         self.assertTrue(up_eaten)
@@ -79,13 +79,13 @@ class TestShortPress(unittest.TestCase):
 
 class TestLongPress(unittest.TestCase):
     def test_long_press_eats_down_passes_up_through(self):
-        engine = CapsLockIME(long_press_threshold=0.05)
+        engine = CapsLockIME(long_press_threshold=0.05, ime_adapter=FakeIME(), led_adapter=FakeLED())
         self.assertTrue(engine.on_key_event(VK_CAPITAL, True))
         time.sleep(0.1)  # timer fires before UP
         self.assertFalse(engine.on_key_event(VK_CAPITAL, False))
 
     def test_long_press_enters_uppercase_mode(self):
-        engine = CapsLockIME(long_press_threshold=0.05)
+        engine = CapsLockIME(long_press_threshold=0.05, ime_adapter=FakeIME(), led_adapter=FakeLED())
         engine.on_key_event(VK_CAPITAL, True)
         time.sleep(0.1)
         engine.on_key_event(VK_CAPITAL, False)
@@ -95,7 +95,7 @@ class TestLongPress(unittest.TestCase):
 
     def test_long_press_turns_led_on(self):
         led = FakeLED()
-        engine = CapsLockIME(long_press_threshold=0.05, led_adapter=led)
+        engine = CapsLockIME(long_press_threshold=0.05, ime_adapter=FakeIME(), led_adapter=led)
         engine.on_key_event(VK_CAPITAL, True)
         time.sleep(0.1)
         engine.on_key_event(VK_CAPITAL, False)
@@ -107,7 +107,7 @@ class TestLongPress(unittest.TestCase):
 
 class TestUppercasePassThrough(unittest.TestCase):
     def test_press_when_uppercase_on_passes_down_through(self):
-        engine = CapsLockIME(long_press_threshold=0.05)
+        engine = CapsLockIME(long_press_threshold=0.05, ime_adapter=FakeIME(), led_adapter=FakeLED())
         engine.on_key_event(VK_CAPITAL, True)
         time.sleep(0.1)
         engine.on_key_event(VK_CAPITAL, False)
@@ -115,20 +115,31 @@ class TestUppercasePassThrough(unittest.TestCase):
 
         self.assertFalse(engine.on_key_event(VK_CAPITAL, True))
 
-    def test_press_when_uppercase_on_turns_led_off(self):
+    def test_press_when_uppercase_on_passes_through_without_led_action(self):
+        ime = FakeIME()
         led = FakeLED()
-        engine = CapsLockIME(long_press_threshold=0.05, led_adapter=led)
+        engine = CapsLockIME(
+            long_press_threshold=0.05, ime_adapter=ime, led_adapter=led
+        )
         engine.on_key_event(VK_CAPITAL, True)
         time.sleep(0.1)
         engine.on_key_event(VK_CAPITAL, False)
         time.sleep(0.05)
 
         led.off_calls = 0
-        engine.on_key_event(VK_CAPITAL, True)
+        self.assertFalse(engine.on_key_event(VK_CAPITAL, True))
+        engine.on_key_event(VK_CAPITAL, False)
         time.sleep(0.05)
 
-        self.assertEqual(led.off_calls, 1)
-        self.assertFalse(led.is_on)
+        # 按键已放行，系统自己关 CapsLock；不应再补发 LED 动作
+        self.assertEqual(led.off_calls, 0)
+
+        # 已退出大写模式：再短按一次应切换 IME，而不是继续放行
+        down_eaten, up_eaten = quick_tap(engine)
+        time.sleep(0.05)
+        self.assertTrue(down_eaten)
+        self.assertTrue(up_eaten)
+        self.assertEqual(ime.toggle_calls, 1)
 
 
 class TestConsecutivePresses(unittest.TestCase):

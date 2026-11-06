@@ -28,6 +28,10 @@ class Preferences:
 
     run_as_administrator: bool = False
     switching_method: SwitchingMethod = SwitchingMethod.KEYBOARD_LAYOUTS
+    disable_system_hotkeys: bool = True
+    block_ctrl_space: bool = True
+    # None migrates installations whose startup state was held only in HKCU Run.
+    autostart: bool | None = None
 
 
 def settings_path() -> Path:
@@ -49,9 +53,18 @@ def load_preferences() -> Preferences:
         switching_method = SwitchingMethod(
             data.get("switching_method", SwitchingMethod.KEYBOARD_LAYOUTS.value)
         )
+        for name in ("disable_system_hotkeys", "block_ctrl_space"):
+            if not isinstance(data.get(name, True), bool):
+                raise ValueError(f"{name} must be true or false")
+        autostart = data.get("autostart")
+        if autostart is not None and not isinstance(autostart, bool):
+            raise ValueError("autostart must be true, false or null")
         return Preferences(
             run_as_administrator=run_as_administrator,
             switching_method=switching_method,
+            disable_system_hotkeys=data.get("disable_system_hotkeys", True),
+            block_ctrl_space=data.get("block_ctrl_space", True),
+            autostart=autostart,
         )
     except FileNotFoundError:
         return Preferences()
@@ -62,7 +75,11 @@ def load_preferences() -> Preferences:
 
 def save_preferences(preferences: Preferences) -> None:
     """Atomically replace the per-user settings file."""
-    path = settings_path()
+    save_json(settings_path(), asdict(preferences))
+
+
+def save_json(path: Path, data: dict) -> None:
+    """Durably replace application settings before changing system state."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fd, temporary_name = tempfile.mkstemp(
@@ -73,7 +90,7 @@ def save_preferences(preferences: Preferences) -> None:
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump(asdict(preferences), stream, ensure_ascii=False, indent=2)
+            json.dump(data, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
