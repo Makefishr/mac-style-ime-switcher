@@ -366,7 +366,16 @@ def _handoff_notice(
     return f"{reason}；管理员模式未启用，MacStyleIME 继续以普通模式运行。"
 
 
+def _enable_dpi_awareness() -> None:
+    """Draw Tk windows sharply on scaled displays, as IDLE does on Windows."""
+    try:
+        ctypes.OleDLL("shcore").SetProcessDpiAwareness(1)  # system DPI aware
+    except (AttributeError, OSError):
+        log.debug("Unable to enable DPI awareness", exc_info=True)
+
+
 def main() -> None:
+    _enable_dpi_awareness()
     arguments = sys.argv[1:]
     try:
         restart_event = elevation.parse_restart_event(arguments)

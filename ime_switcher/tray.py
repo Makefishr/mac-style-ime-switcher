@@ -14,14 +14,18 @@ log = logging.getLogger(__name__)
 
 # ── Tray icon (PIL) ───────────────────────────────────────
 
-def _make_tray_image():
-    from PIL import Image
-
+def app_icon_path() -> str:
     if getattr(sys, 'frozen', False):
         base = sys._MEIPASS
     else:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ico = Image.open(os.path.join(base, "app.ico"))
+    return os.path.join(base, "app.ico")
+
+
+def _make_tray_image():
+    from PIL import Image
+
+    ico = Image.open(app_icon_path())
     return ico.resize((64, 64), Image.LANCZOS)
 
 

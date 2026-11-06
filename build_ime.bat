@@ -69,6 +69,7 @@ echo [2/3] Building the executable...
     --hidden-import PIL ^
     --hidden-import PIL.Image ^
     --hidden-import PIL.ImageDraw ^
+    --hidden-import PIL.ImageTk ^
     --hidden-import ime_switcher.config ^
     --hidden-import ime_switcher.winapi ^
     --hidden-import ime_switcher.toggle ^
@@ -81,6 +82,7 @@ echo [2/3] Building the executable...
     --hidden-import tkinter ^
     --hidden-import tkinter.ttk ^
     --hidden-import tkinter.messagebox ^
+    --hidden-import tkinter.font ^
     --add-data "app.ico;." ^
     --icon "app.ico" ^
     --distpath "." ^
