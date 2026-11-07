@@ -32,3 +32,13 @@ class TestIsolationTests(unittest.TestCase):
             any(isinstance(handler, logging.FileHandler)
                 for handler in logging.getLogger().handlers)
         )
+
+
+class ReleaseMetadataTests(unittest.TestCase):
+    def test_exe_version_resource_matches_app_version(self):
+        text = (Path(config.__file__).resolve().parent.parent / "version_info.txt").read_text(encoding="utf-8")
+        numbers = tuple(int(part) for part in config.VERSION.split(".")) + (0,)
+        self.assertIn(f"filevers={numbers}", text)
+        self.assertIn(f"prodvers={numbers}", text)
+        self.assertIn(f"StringStruct('FileVersion', '{config.VERSION}')", text)
+        self.assertIn(f"StringStruct('ProductVersion', '{config.VERSION}')", text)

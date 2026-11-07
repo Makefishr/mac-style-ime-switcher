@@ -26,13 +26,24 @@ def _make_tray_image():
     from PIL import Image
 
     ico = Image.open(app_icon_path())
-    return ico.resize((64, 64), Image.LANCZOS)
+    if (64, 64) in ico.info.get("sizes", ()):
+        ico.size = (64, 64)
+    return ico.convert("RGBA").resize((64, 64), Image.LANCZOS)
 
 
 # ── Auto-start ───────────────────────────────────────────
 
 def is_autostart_enabled() -> bool:
     return WindowsStartup().is_enabled()
+
+
+def is_autostart_disabled_by_windows() -> bool:
+    """Return whether Task Manager's Startup apps switch turned us off."""
+    try:
+        return WindowsStartup().is_disabled()
+    except OSError:
+        log.debug("Unable to read the Windows startup approval state", exc_info=True)
+        return False
 
 
 def install_autostart() -> None:

@@ -26,7 +26,7 @@ from ime_switcher.settings_store import (
     save_preferences,
 )
 from ime_switcher.settings_ui import SettingsWindow
-from ime_switcher.autostart import WindowsStartup
+from ime_switcher.autostart import AUTOSTART_TASK_FLAG, WindowsStartup
 from ime_switcher.system_hotkeys import LanguageHotkeys
 from ime_switcher.winapi import kernel32
 
@@ -94,7 +94,7 @@ class _DesktopRuntime:
         preferences = load_preferences()
         if preferences.autostart is None:
             try:
-                preferences = replace(preferences, autostart=WindowsStartup().is_enabled())
+                preferences = replace(preferences, autostart=WindowsStartup().is_registered())
                 save_preferences(preferences)
             except OSError as exc:
                 log.exception("Unable to migrate startup registration")
@@ -102,7 +102,13 @@ class _DesktopRuntime:
         for notice in self._apply_preferences(preferences, request_elevation=False):
             self._append_startup_notice(notice)
 
-    def _apply_preferences(self, preferences: Preferences, *, request_elevation: bool) -> list[str]:
+    def _apply_preferences(
+        self,
+        preferences: Preferences,
+        *,
+        request_elevation: bool,
+        reenable_autostart: bool = False,
+    ) -> list[str]:
         """Apply independent preferences and report precisely which parts failed."""
         notices = []
         toggle.set_switching_method(preferences.switching_method)
@@ -116,12 +122,19 @@ class _DesktopRuntime:
         try:
             startup = WindowsStartup()
             needs_elevation = request_elevation and preferences.run_as_administrator and not elevation.is_elevated()
+            if reenable_autostart and preferences.autostart:
+                # Carry an explicit re-enable through the elevated runtime's repair.
+                startup.reset_approval()
+            # Repair registration even while Windows keeps its Run entry disabled.
             if preferences.autostart is not None:
                 if not startup.is_configured(preferences.autostart, preferences.run_as_administrator):
                     if needs_elevation or startup.needs_elevation(preferences.autostart, preferences.run_as_administrator):
                         needs_elevation = True
                     else:
-                        startup.apply(preferences.autostart, preferences.run_as_administrator)
+                        startup.apply(
+                            preferences.autostart, preferences.run_as_administrator,
+                            preserve_approval=True,
+                        )
             if needs_elevation:
                 if request_elevation:
                     self._request_elevation()
@@ -269,16 +282,28 @@ class _DesktopRuntime:
         switching_method: SwitchingMethod,
         disable_system_hotkeys: bool,
         block_ctrl_space: bool,
+        *,
+        autostart_changed: bool | None = None,
     ) -> bool:
+        """Save settings; the UI compares its displayed startup switch to its baseline.
+
+        Passing False preserves the saved startup intent when Windows disabled it.
+        Passing True explicitly changes that intent and permits re-enabling startup.
+        """
+        previous = load_preferences()
+        if autostart_changed is None:
+            autostart_changed = previous.autostart != autostart
         preferences = Preferences(
             run_as_administrator=run_as_administrator,
             switching_method=switching_method,
             disable_system_hotkeys=disable_system_hotkeys,
             block_ctrl_space=block_ctrl_space,
-            autostart=autostart,
+            autostart=autostart if autostart_changed else previous.autostart,
         )
         save_preferences(preferences)
-        notices = self._apply_preferences(preferences, request_elevation=True)
+        notices = self._apply_preferences(
+            preferences, request_elevation=True, reenable_autostart=autostart_changed and autostart,
+        )
         if notices:
             messagebox.showwarning(
                 "设置已保存，部分尚未生效", "\n\n".join(notices), parent=self._root,
@@ -299,7 +324,7 @@ def _startup_cli_message(cmd: str, preferences: Preferences) -> str:
     if cmd == "--uninstall":
         return _UNINSTALL_MESSAGE
     if preferences.run_as_administrator:
-        return "已添加登录自启（管理员模式：计划任务）。"
+        return "已添加登录自启（管理员模式：启动项与按需任务）。"
     return "已添加登录自启（普通模式：启动项）。"
 
 
@@ -337,11 +362,12 @@ def _handle_cli(arguments: list[str]) -> bool:
         print(__doc__ or "")
         print(f"Mac-style IME Switcher v{config.VERSION}")
         print("  --install    按管理员模式设置添加登录自启（必要时请求 UAC）")
-        print("  --uninstall  移除启动项和登录任务（必要时请求 UAC）")
+        print("  --uninstall  移除启动项和自启任务（必要时请求 UAC）")
+        print("  --autostart  登录时启动（内部使用，不请求 UAC）")
         print("  --help       显示此帮助")
     else:
         print(f"未知命令: {cmd}")
-        print("用法: MacStyleIME.exe [--install|--uninstall|--help]")
+        print("用法: MacStyleIME.exe [--install|--uninstall|--autostart|--help]")
     return True
 
 
@@ -377,6 +403,8 @@ def _enable_dpi_awareness() -> None:
 def main() -> None:
     _enable_dpi_awareness()
     arguments = sys.argv[1:]
+    task_launch = arguments == [AUTOSTART_TASK_FLAG]
+    autostart_launch = arguments == ["--autostart"] or task_launch
     try:
         restart_event = elevation.parse_restart_event(arguments)
     except ValueError as exc:
@@ -387,8 +415,21 @@ def main() -> None:
         if not elevation.is_elevated():
             log.error("Elevated restart did not receive an elevated token")
             return
-    elif _handle_cli(arguments):
+    elif not autostart_launch and _handle_cli(arguments):
         return
+
+    startup_notice = None
+    if autostart_launch:
+        preferences = load_preferences()
+        if preferences.run_as_administrator and not elevation.is_elevated() and not task_launch:
+            # The task must be launched before this process owns the mutex.
+            try:
+                WindowsStartup().start_elevated()
+            except OSError:
+                log.exception("Unable to start elevated autostart task; continuing in standard mode")
+                startup_notice = "管理员自启任务未能启动，本次以普通模式运行；请在设置中重新保存登录自启。"
+            else:
+                return
 
     mutex_handle = _acquire_single_instance(
         elevation.HANDOFF_TIMEOUT_MS if restart_event is not None else 0
@@ -414,7 +455,8 @@ def main() -> None:
         mutex_handle = _acquire_single_instance(5_000)
         return mutex_handle is not None
 
-    preferences = load_preferences()
+    if not autostart_launch:
+        preferences = load_preferences()
     toggle.set_switching_method(preferences.switching_method)
 
     try:
@@ -429,8 +471,7 @@ def main() -> None:
             )
             return
 
-        startup_notice = None
-        if preferences.run_as_administrator and not elevation.is_elevated():
+        if not autostart_launch and preferences.run_as_administrator and not elevation.is_elevated():
             result = elevation.handoff_to_elevated(release_current_instance)
             if result.status is elevation.HandoffStatus.READY:
                 return

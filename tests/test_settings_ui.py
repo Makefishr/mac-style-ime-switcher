@@ -27,11 +27,26 @@ class SettingsWindowTests(unittest.TestCase):
         with (
             patch.object(settings_ui, "load_preferences", return_value=replace(Preferences(), autostart=True)),
             patch.object(settings_ui.tray, "is_autostart_enabled") as actual,
+            patch.object(settings_ui.tray, "is_autostart_disabled_by_windows", return_value=False),
             patch.object(settings_ui.elevation, "is_elevated", return_value=False),
         ):
             window.refresh_effective_state()
         window._autostart.set.assert_called_once_with(True)
         actual.assert_not_called()
+
+    def test_refresh_shows_startup_disabled_in_task_manager_as_off(self):
+        window = settings_ui.SettingsWindow.__new__(settings_ui.SettingsWindow)
+        for name in ("_run_as_admin", "_autostart", "_switching_method",
+                     "_disable_system_hotkeys", "_block_ctrl_space", "_status"):
+            setattr(window, name, Mock())
+        with (
+            patch.object(settings_ui, "load_preferences", return_value=replace(Preferences(), autostart=True)),
+            patch.object(settings_ui.tray, "is_autostart_disabled_by_windows", return_value=True),
+            patch.object(settings_ui.elevation, "is_elevated", return_value=False),
+        ):
+            window.refresh_effective_state()
+        window._autostart.set.assert_called_once_with(False)
+        self.assertTrue(window._autostart_blocked)
 
 
 class ChangeHintTests(unittest.TestCase):
@@ -62,6 +77,16 @@ class ChangeHintTests(unittest.TestCase):
             elevated=True,
         )
         self.assertIn("计划任务", hint)
+        self.assertIn("启动应用", hint)
+
+    def test_reenabling_autostart_disabled_in_task_manager_says_so(self):
+        window = _window_with_values(
+            (False, True, self.METHOD, True, True),
+            (False, False, self.METHOD, True, True),
+            elevated=False,
+        )
+        window._autostart_blocked = True
+        self.assertIn("重新启用", window._change_hint())
 
     def test_restoring_system_shortcuts_mentions_sign_out(self):
         hint = self.hint(
@@ -98,6 +123,9 @@ class SettingsWindowSmokeTests(unittest.TestCase):
         patcher = patch.object(settings_ui.elevation, "is_elevated", return_value=False)
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = patch.object(settings_ui.tray, "is_autostart_disabled_by_windows", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         patcher = patch.object(settings_ui, "_style_title_bar")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -118,8 +146,17 @@ class SettingsWindowSmokeTests(unittest.TestCase):
         window._save_button.invoke()
         on_save.assert_called_once_with(
             True, False, SwitchingMethod.KEYBOARD_LAYOUTS, True, True,
+            autostart_changed=False,
         )
         self.assertFalse(window._window.winfo_viewable())
+
+    def test_save_reports_an_explicit_autostart_change(self):
+        on_save = Mock(return_value=True)
+        window = settings_ui.SettingsWindow(self.root, on_save)
+        window.show()
+        window._autostart.set(True)
+        window._save_button.invoke()
+        self.assertTrue(on_save.call_args.kwargs["autostart_changed"])
 
     def test_cancel_discards_pending_changes(self):
         on_save = Mock(return_value=True)

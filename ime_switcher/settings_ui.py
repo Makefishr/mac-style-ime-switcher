@@ -434,11 +434,12 @@ class SettingsWindow:
     _pill: tk.Canvas | None = None
     _hint_frame: tk.Frame | None = None
     _elevated = False
+    _autostart_blocked = False
 
     def __init__(
         self,
         root: tk.Tk,
-        on_save: Callable[[bool, bool, SwitchingMethod, bool, bool], bool],
+        on_save: Callable[..., bool],
     ) -> None:
         self._root = root
         self._on_save = on_save
@@ -481,10 +482,13 @@ class SettingsWindow:
     def refresh_effective_state(self) -> None:
         preferences = load_preferences()
         self._run_as_admin.set(preferences.run_as_administrator)
-        self._autostart.set(
+        autostart = (
             tray.is_autostart_enabled() if preferences.autostart is None
             else preferences.autostart
         )
+        # Show Task Manager's Startup apps switch as the effective state.
+        self._autostart_blocked = bool(autostart) and tray.is_autostart_disabled_by_windows()
+        self._autostart.set(bool(autostart) and not self._autostart_blocked)
         self._switching_method.set(preferences.switching_method.value)
         self._disable_system_hotkeys.set(preferences.disable_system_hotkeys)
         self._block_ctrl_space.set(preferences.block_ctrl_space)
@@ -527,8 +531,10 @@ class SettingsWindow:
             return "保存后会弹出 UAC，并以管理员身份重新启动。取消 UAC 则继续以普通模式运行。"
         if not admin and self._elevated and old_admin:
             return "保存后，下次启动将以普通模式运行；本次仍保持管理员模式。"
+        if autostart and not old_autostart and self._autostart_blocked:
+            return "将在任务管理器的“启动应用”中重新启用本程序。"
         if autostart and not old_autostart and admin:
-            return "将创建登录计划任务，以后登录时自动以管理员身份运行，不再弹出 UAC。"
+            return "将添加到任务管理器的“启动应用”，并创建计划任务；登录时以管理员身份运行，不弹出 UAC。"
         if old_disable_hotkeys and not disable_hotkeys:
             return "将恢复系统原有的语言切换快捷键；若未生效，请注销后重新登录。"
         return ""
@@ -625,7 +631,7 @@ class SettingsWindow:
         self._divider(card, 1)
         self._switch_row(
             card, 2, "开机时自动运行",
-            "管理员模式下使用登录计划任务，登录时不会弹出 UAC。",
+            "会显示在任务管理器的“启动应用”中；管理员模式下登录时不弹出 UAC。",
             self._autostart,
         )
         self._round_corners(card)
@@ -811,6 +817,8 @@ class SettingsWindow:
                 SwitchingMethod(self._switching_method.get()),
                 self._disable_system_hotkeys.get(),
                 self._block_ctrl_space.get(),
+                autostart_changed=self._baseline is not None
+                and self._autostart.get() != self._baseline[1],
             )
             self.refresh_effective_state()
             if should_close:

@@ -85,6 +85,7 @@ echo [2/3] Building the executable...
     --hidden-import tkinter.font ^
     --add-data "app.ico;." ^
     --icon "app.ico" ^
+    --version-file "version_info.txt" ^
     --distpath "." ^
     ime_switcher\__main__.py
 

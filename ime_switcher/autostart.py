@@ -1,4 +1,4 @@
-"""Current-user startup registration via HKCU Run or an interactive logon task."""
+"""Current-user Run registration with an optional elevated on-demand task."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from xml.etree import ElementTree as ET
 from . import config, elevation
 
 log = logging.getLogger(__name__)
+STARTUP_APPROVED_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+AUTOSTART_TASK_FLAG = "--autostart-task"
 
 
 def launch_command() -> tuple[str, list[str]]:
@@ -26,14 +28,14 @@ def launch_command() -> tuple[str, list[str]]:
 
 def run_command() -> str:
     executable, arguments = launch_command()
-    return subprocess.list2cmdline([executable, *arguments])
+    return subprocess.list2cmdline([executable, *arguments, "--autostart"])
 
 
 def startup_method(enabled: bool, administrator: bool) -> str:
     return "task" if enabled and administrator else "run" if enabled else "disabled"
 
 
-def task_xml(username: str, sid: str, executable: str, arguments: list[str]) -> str:
+def task_xml(username: str, executable: str, arguments: list[str]) -> str:
     namespace = "http://schemas.microsoft.com/windows/2004/02/mit/task"
     ET.register_namespace("", namespace)
 
@@ -43,15 +45,15 @@ def task_xml(username: str, sid: str, executable: str, arguments: list[str]) -> 
         return node
 
     root = ET.Element(f"{{{namespace}}}Task", {"version": "1.3"})
-    trigger = element(element(root, "Triggers"), "LogonTrigger")
-    element(trigger, "Enabled", "true")
-    element(trigger, "UserId", sid)
+    # Run is the sole logon entry so Windows' startup disable switch is honored.
+    element(root, "Triggers")
     principal = element(element(root, "Principals"), "Principal", id="Author")
     element(principal, "UserId", username)
     element(principal, "LogonType", "InteractiveToken")
     element(principal, "RunLevel", "HighestAvailable")
     settings = element(root, "Settings")
     for name, value in (
+        ("AllowStartOnDemand", "true"),
         ("MultipleInstancesPolicy", "IgnoreNew"),
         ("DisallowStartIfOnBatteries", "false"),
         ("StopIfGoingOnBatteries", "false"),
@@ -61,8 +63,8 @@ def task_xml(username: str, sid: str, executable: str, arguments: list[str]) -> 
         element(settings, name, value)
     action = element(element(root, "Actions", Context="Author"), "Exec")
     element(action, "Command", executable)
-    if arguments:
-        element(action, "Arguments", subprocess.list2cmdline(arguments))
+    # A task can receive a standard token under policy; keep login UAC-free then too.
+    element(action, "Arguments", subprocess.list2cmdline([*arguments, AUTOSTART_TASK_FLAG]))
     element(action, "WorkingDirectory", str(config.APP_DIR))
     return ET.tostring(root, encoding="unicode", xml_declaration=False)
 
@@ -110,21 +112,50 @@ class WindowsStartup:
         return any(row and row[0].casefold() == expected.casefold()
                    for row in csv.reader(io.StringIO(output)))
 
-    def run_exists(self, *, matching_command: bool = True) -> bool:
+    def run_exists(self, *, matching_command: bool = True, allow_legacy: bool = True) -> bool:
         registry = self._registry
         try:
             with registry.OpenKey(registry.HKEY_CURRENT_USER, config.REG_RUN_KEY, 0, registry.KEY_READ) as key:
                 value, kind = registry.QueryValueEx(key, config.APP_NAME)
                 if not matching_command:
                     return True
-                executable, arguments = launch_command()
-                legacy_command = " ".join(f'"{item}"' for item in [executable, *arguments])
-                return kind == registry.REG_SZ and value in (run_command(), legacy_command)
+                commands = [run_command()]
+                if allow_legacy:
+                    executable, arguments = launch_command()
+                    legacy_command = " ".join(f'"{item}"' for item in [executable, *arguments])
+                    commands.extend((subprocess.list2cmdline([executable, *arguments]), legacy_command))
+                return kind == registry.REG_SZ and value in commands
         except FileNotFoundError:
             return False
 
     def is_enabled(self) -> bool:
+        if self.is_disabled():
+            return False
         return self.run_exists() or self.task_exists()
+
+    def is_registered(self) -> bool:
+        """Read the legacy desired state independently of Windows' disable switch."""
+        return self.run_exists(matching_command=False) or self.task_exists()
+
+    def _approval_value(self):
+        registry = self._registry
+        try:
+            with registry.OpenKey(registry.HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY, 0, registry.KEY_READ) as key:
+                return registry.QueryValueEx(key, config.APP_NAME)
+        except FileNotFoundError:
+            return None
+
+    def is_disabled(self) -> bool:
+        """Return whether Windows' Startup Apps switch disabled our Run entry."""
+        approval = self._approval_value()
+        if approval is None:
+            return False
+        value, kind = approval
+        return kind == self._registry.REG_BINARY and bool(value) and bool(value[0] & 1)
+
+    def start_elevated(self) -> None:
+        """Request the previously registered task without requesting UAC."""
+        self._run("schtasks.exe", "/Run", "/TN", self._task_name())
 
     def is_configured(self, enabled: bool, administrator: bool) -> bool:
         """Check the requested registration without changing or recreating it."""
@@ -132,18 +163,20 @@ class WindowsStartup:
         method = startup_method(enabled, administrator)
         if method != "task":
             return not exists and (
-                self.run_exists() if enabled else not self.run_exists(matching_command=False)
+                self.run_exists(allow_legacy=False) if enabled else (
+                    not self.run_exists(matching_command=False) and self._approval_value() is None
+                )
             )
-        if not exists or self.run_exists(matching_command=False):
+        if not exists or not self.run_exists(allow_legacy=False):
             return False
         output = self._run("schtasks.exe", "/Query", "/TN", self._task_name(), "/XML")
         try:
             actual = ET.fromstring(output)
         except ET.ParseError as exc:
-            raise OSError("无法读取登录任务的 XML，请查看日志后重试") from exc
+            raise OSError("无法读取自启任务的 XML，请查看日志后重试") from exc
         username, sid = self._user()
         executable, arguments = launch_command()
-        expected = ET.fromstring(task_xml(username, sid, executable, arguments))
+        expected = ET.fromstring(task_xml(username, executable, arguments))
         namespace = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
         principal_user_path = f"{namespace}Principals/{namespace}Principal/{namespace}UserId"
         actual_user = actual.findtext(principal_user_path, "")
@@ -152,6 +185,9 @@ class WindowsStartup:
             expected.find(principal_user_path).text = actual_user
 
         def matches(wanted, found, allow_extra=False):
+            # Scheduler can omit the empty, optional Triggers element on export.
+            if wanted.tag == namespace + "Triggers" and len(wanted) == 0 and found is None:
+                return True
             if found is None or wanted.tag != found.tag:
                 return False
             if (wanted.text or "").strip() != (found.text or "").strip():
@@ -191,21 +227,35 @@ class WindowsStartup:
         with registry.CreateKeyEx(registry.HKEY_CURRENT_USER, config.REG_RUN_KEY, 0, registry.KEY_SET_VALUE) as key:
             registry.SetValueEx(key, config.APP_NAME, 0, registry.REG_SZ, command)
 
+    def reset_approval(self) -> None:
+        """Clear Windows' override after an explicit startup settings change."""
+        registry = self._registry
+        try:
+            with registry.OpenKey(registry.HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY, 0, registry.KEY_SET_VALUE) as key:
+                registry.DeleteValue(key, config.APP_NAME)
+        except FileNotFoundError:
+            return
+        log.info("Removed Windows startup approval override for %s", config.APP_NAME)
+
     def _create_task(self) -> None:
-        username, sid = self._user()
+        username = self._user()[0]
         executable, arguments = launch_command()
         name = self._task_name()
-        xml = task_xml(username, sid, executable, arguments)
+        xml = task_xml(username, executable, arguments)
         config.USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        log.info("Creating logon task %s with command: %s", name, run_command())
+        log.info("Creating on-demand task %s with command: %s", name,
+                 subprocess.list2cmdline([executable, *arguments, AUTOSTART_TASK_FLAG]))
         # The XML holds no credentials; InteractiveToken reuses the logged-in user.
         with tempfile.TemporaryDirectory(prefix="startup-", dir=config.USER_DATA_DIR) as folder:
             path = Path(folder) / "task.xml"
             path.write_text('<?xml version="1.0" encoding="UTF-16"?>\n' + xml, encoding="utf-16")
             self._run("schtasks.exe", "/Create", "/TN", name, "/XML", str(path), "/F")
 
-    def apply(self, enabled: bool, administrator: bool) -> None:
+    def apply(self, enabled: bool, administrator: bool, *, preserve_approval: bool = False) -> None:
+        """Update registration, optionally keeping Windows' startup override."""
         if self.is_configured(enabled, administrator):
+            if not preserve_approval or not enabled:
+                self.reset_approval()
             log.debug(
                 "Startup registration already matches enabled=%s administrator=%s; nothing to change",
                 enabled, administrator,
@@ -214,15 +264,17 @@ class WindowsStartup:
         method = startup_method(enabled, administrator)
         exists = self.task_exists()
         if not self._elevated() and (method == "task" or exists):
-            raise PermissionError("需要管理员权限才能更新登录计划任务")
+            raise PermissionError("需要管理员权限才能更新自启计划任务")
         if method == "task":
             self._create_task()
-            self._remove_run()
+            self._write_run()
         else:
             if method == "run":
                 self._write_run()
             if exists:
-                log.info("Deleting logon task %s", self._task_name())
+                log.info("Deleting startup task %s", self._task_name())
                 self._run("schtasks.exe", "/Delete", "/TN", self._task_name(), "/F")
             if method == "disabled":
                 self._remove_run()
+        if not preserve_approval or not enabled:
+            self.reset_approval()

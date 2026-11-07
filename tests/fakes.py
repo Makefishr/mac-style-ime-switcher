@@ -79,4 +79,7 @@ class Scheduler:
             if self.fail == "delete":
                 return CompletedProcess(command, 1, "", "access denied")
             self.tasks.remove(command[command.index("/TN") + 1])
+        elif "/Run" in command:
+            if self.fail == "run" or command[command.index("/TN") + 1] not in self.tasks:
+                return CompletedProcess(command, 1, "", "task cannot be started")
         return CompletedProcess(command, 0, output.getvalue(), "")

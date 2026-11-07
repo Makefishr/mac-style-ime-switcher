@@ -9,7 +9,7 @@ from pathlib import Path
 # ── App identity ──────────────────────────────────────────
 APP_NAME  = "MacStyleIME"
 APP_TITLE = "Mac-style IME Switcher"
-VERSION   = "1.4.0"
+VERSION   = "2.0.0"
 
 
 def _running_under_tests() -> bool:
